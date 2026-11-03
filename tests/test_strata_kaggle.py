@@ -10,6 +10,8 @@ from unittest.mock import patch
 from pathlib import Path
 
 from scripts.strata_kaggle import redact, safe_extract_runtime, _sha256, opencode_config_snippet, _cached_model_path, run_streaming, restore_model_cache, _copy_verified
+from scripts.strata_kaggle import (_drafting_args, drafting_status, mtp_layer_path,
+                                   restore_draft_layer, _draft_layer_entries)
 
 
 class StrataKaggleTests(unittest.TestCase):
@@ -240,6 +242,141 @@ class StrataKaggleTests(unittest.TestCase):
             "none",
         )
         self.assertNotIn("sk-strata-", value)
+
+
+class DraftingTests(unittest.TestCase):
+    def test_drafting_args_defaults_to_the_draft_layer(self):
+        self.assertEqual(_drafting_args("auto"), ["--mtp", "on", "--drafting", "auto"])
+        self.assertEqual(_drafting_args("MTP"), ["--mtp", "on", "--drafting", "mtp"])
+        self.assertEqual(_drafting_args("off"), ["--mtp", "off", "--drafting", "off"])
+        self.assertEqual(_drafting_args("dflash2"), ["--mtp", "off", "--drafting", "dflash2"])
+        self.assertEqual(_drafting_args(None), ["--mtp", "on", "--drafting", "auto"])
+
+    def test_drafting_args_rejects_unknown_mode(self):
+        with self.assertRaises(ValueError):
+            _drafting_args("sometimes")
+
+    def test_drafting_status_reports_missing_layer(self):
+        with tempfile.TemporaryDirectory() as td:
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                status = drafting_status(Path(td), "auto")
+            self.assertFalse(status["ready"])
+            self.assertTrue(status["needs_mtp_layer"])
+            self.assertEqual(status["mtp_fetch_gb"], 5.2)
+            self.assertIn("5.2 GB", output.getvalue())
+
+    def test_drafting_status_skips_layer_when_drafting_off(self):
+        with tempfile.TemporaryDirectory() as td:
+            status = drafting_status(Path(td), "off")
+            self.assertTrue(status["ready"])
+            self.assertFalse(status["needs_mtp_layer"])
+            self.assertEqual(status["mtp_fetch_gb"], 0.0)
+
+    def test_drafting_status_finds_existing_layer(self):
+        with tempfile.TemporaryDirectory() as td:
+            layer = Path(td) / "mtp" / "rt"
+            layer.mkdir(parents=True)
+            (layer / "experts.bin").write_bytes(b"x")
+            self.assertEqual(mtp_layer_path(Path(td)), layer)
+            status = drafting_status(Path(td), "auto")
+            self.assertTrue(status["ready"])
+            self.assertEqual(status["mtp_fetch_gb"], 0.0)
+
+    def test_draft_layer_entries_reads_both_layouts(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "mtp_rt__experts.bin").write_bytes(b"a")
+            (root / "mtp_rt__draft_vocab.bin").write_bytes(b"b")
+            entries = _draft_layer_entries(root)
+            self.assertEqual(sorted(entries), ["draft_vocab.bin", "experts.bin"])
+
+            nested = root / "nested"
+            (nested / "mtp" / "rt").mkdir(parents=True)
+            (nested / "mtp" / "rt" / "experts.bin").write_bytes(b"c")
+            self.assertEqual(list(_draft_layer_entries(nested)), ["experts.bin"])
+
+    def test_restore_draft_layer_copies_flattened_files(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            input_root = root / "input" / "datasets"
+            dataset = input_root / "clothespin" / "strata-qfn-assets-lite"
+            dataset.mkdir(parents=True)
+            (dataset / "mtp_rt__experts.bin").write_bytes(b"e" * 4096)
+            (dataset / "mtp_rt__draft_vocab.bin").write_bytes(b"v" * 16)
+            local = root / "local"
+            with patch("scripts.strata_kaggle.INPUT_ROOT", input_root):
+                restored = restore_draft_layer(
+                    "clothespin", "strata-qfn-assets-lite", local, restore_mode="copy",
+                    min_experts_bytes=1)
+            self.assertTrue(restored)
+            self.assertEqual((local / "mtp" / "rt" / "experts.bin").read_bytes(), b"e" * 4096)
+            self.assertEqual((local / "mtp" / "rt" / "draft_vocab.bin").read_bytes(), b"v" * 16)
+
+    def test_restore_draft_layer_symlinks_when_asked(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            input_root = root / "input" / "datasets"
+            dataset = input_root / "clothespin" / "strata-qfn-assets-lite"
+            dataset.mkdir(parents=True)
+            source = dataset / "mtp_rt__experts.bin"
+            source.write_bytes(b"e" * 4096)
+            local = root / "local"
+            with patch("scripts.strata_kaggle.INPUT_ROOT", input_root):
+                restored = restore_draft_layer(
+                    "clothespin", "strata-qfn-assets-lite", local, restore_mode="symlink",
+                    min_experts_bytes=1)
+            target = local / "mtp" / "rt" / "experts.bin"
+            self.assertTrue(restored)
+            self.assertTrue(target.is_symlink())
+            self.assertEqual(target.resolve(), source.resolve())
+
+    def test_restore_draft_layer_skips_when_already_present(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            layer = root / "mtp" / "rt"
+            layer.mkdir(parents=True)
+            (layer / "experts.bin").write_bytes(b"x")
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                restored = restore_draft_layer("owner", "slug", root)
+            self.assertFalse(restored)
+            self.assertIn("already present", output.getvalue())
+
+    def test_restore_draft_layer_reports_a_missing_dataset(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            input_root = root / "input" / "datasets"
+            input_root.mkdir(parents=True)
+            output = io.StringIO()
+            with patch("scripts.strata_kaggle.INPUT_ROOT", input_root):
+                with contextlib.redirect_stdout(output):
+                    restored = restore_draft_layer("owner", "slug", root / "local")
+            self.assertFalse(restored)
+            self.assertIn("not attached", output.getvalue())
+
+    def test_restore_draft_layer_rejects_a_dataset_without_a_layer(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            input_root = root / "input" / "datasets"
+            dataset = input_root / "owner" / "slug"
+            dataset.mkdir(parents=True)
+            (dataset / "mtp_rt__draft_vocab.bin").write_bytes(b"v")
+            with patch("scripts.strata_kaggle.INPUT_ROOT", input_root):
+                with self.assertRaises(RuntimeError):
+                    restore_draft_layer("owner", "slug", root / "local")
+
+    def test_restore_draft_layer_default_threshold_rejects_tiny_experts(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            input_root = root / "input" / "datasets"
+            dataset = input_root / "owner" / "slug"
+            dataset.mkdir(parents=True)
+            (dataset / "mtp_rt__experts.bin").write_bytes(b"e" * 4096)
+            with patch("scripts.strata_kaggle.INPUT_ROOT", input_root):
+                with self.assertRaises(RuntimeError) as caught:
+                    restore_draft_layer("owner", "slug", root / "local")
+            self.assertIn("bytes are required", str(caught.exception))
 
 
 if __name__ == "__main__":

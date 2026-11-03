@@ -710,11 +710,192 @@ def _model_source_args(data_dir: Path, family: str, variant: str) -> list[str]:
     return ["--data-dir", str(data_dir)]
 
 
+DRAFTING_MODES = ("auto", "mtp", "dflash2", "off")
+MTP_FETCH_GB = 5.2
+
+
+def _drafting_args(drafting: str) -> list[str]:
+    """Map the notebook's drafting choice to Strata launch flags.
+
+    "auto" and "mtp" load the model's own draft layer (about 5.2 GB on disk and
+    1.08 GiB of VRAM) and are the upstream default. "dflash2" selects the
+    separate Qwen3.8-Flash-Next drafter instead, so the MTP layer is not needed.
+    "off" disables the drafter; prompt-lookup/suffix speculation still runs.
+    """
+    mode = (drafting or "auto").strip().lower()
+    if mode not in DRAFTING_MODES:
+        raise ValueError("drafting must be one of " + ", ".join(DRAFTING_MODES))
+    if mode == "off":
+        return ["--mtp", "off", "--drafting", "off"]
+    if mode == "dflash2":
+        return ["--mtp", "off", "--drafting", "dflash2"]
+    return ["--mtp", "on", "--drafting", mode]
+
+
+def mtp_layer_path(data_dir: Path) -> Path | None:
+    """The fetched MTP draft layer (data_dir/mtp/rt), when it is complete."""
+    layer = Path(data_dir) / "mtp" / "rt"
+    return layer if (layer / "experts.bin").is_file() else None
+
+
+def drafting_status(data_dir: Path, drafting: str = "auto") -> dict[str, Any]:
+    """Report whether the requested drafter is ready before a long launch/upload."""
+    mode = (drafting or "auto").strip().lower()
+    if mode not in DRAFTING_MODES:
+        raise ValueError("drafting must be one of " + ", ".join(DRAFTING_MODES))
+    layer = mtp_layer_path(data_dir)
+    needs_mtp = mode in {"auto", "mtp"}
+    ready = bool(layer) if needs_mtp else True
+    status = {
+        "drafting": mode,
+        "needs_mtp_layer": needs_mtp,
+        "mtp_layer": str(layer) if layer else None,
+        "ready": ready,
+        "mtp_fetch_gb": 0.0 if ready or not needs_mtp else MTP_FETCH_GB,
+    }
+    if needs_mtp and not layer:
+        log(f"Draft layer not cached yet: the first launch downloads about {MTP_FETCH_GB} GB. "
+            "Keep it under MODEL_DATA_DIR so the private model cache includes it.")
+    elif needs_mtp:
+        log("Draft layer found at " + str(layer) + "; it will be reused from the cache.")
+    else:
+        log("Draft layer not used by drafting=" + mode + ".")
+    return status
+
+
+def stop_strata() -> None:
+    """Stop a running Strata server without failing when none is running."""
+    run_command(["strata", "launch", "--stop"], check=False, timeout=180)
+
+
+#: Flattened file prefix used by public mirrors of a Strata data folder.
+DRAFT_LAYER_PREFIX = "mtp_rt__"
+#: Sizes of the packed draft layer in the build this helper was written against.
+#: A different Strata version can pack these differently, so a mismatch warns
+#: instead of failing: the engine checks the layer itself at start.
+KNOWN_DRAFT_LAYER_SIZES = {
+    "experts.bin": 707_788_800,
+    "dense.bin": 116_099_072,
+    "dense.txt": 1_851,
+    "draft_vocab.bin": 425_196,
+}
+#: The engine refuses a layer whose experts file is missing or truncated.
+MIN_DRAFT_LAYER_BYTES = 64 * 1024 * 1024
+
+
+def _dataset_dirs(owner: str, slug: str) -> list[Path]:
+    """Every place an attached Kaggle dataset for owner/slug may be mounted."""
+    candidates: list[Path] = []
+    for path in (INPUT_ROOT / owner / slug, INPUT_ROOT / slug):
+        if path.is_dir():
+            candidates.append(path)
+    if INPUT_ROOT.exists():
+        for path in sorted(INPUT_ROOT.rglob(slug)):
+            if path.is_dir() and path not in candidates:
+                candidates.append(path)
+    return candidates
+
+
+def _draft_layer_entries(dataset_root: Path) -> dict[str, Path]:
+    """Map a dataset's draft-layer files to their names inside mtp/rt/.
+
+    Accepts a real ``mtp/rt/`` folder as well as the flattened
+    ``mtp_rt__<name>`` layout some public mirrors use.
+    """
+    found: dict[str, Path] = {}
+    real = dataset_root / "mtp" / "rt"
+    if real.is_dir():
+        for path in sorted(real.iterdir()):
+            if path.is_file():
+                found[path.name] = path
+    for path in sorted(dataset_root.rglob(DRAFT_LAYER_PREFIX + "*")):
+        if path.is_file():
+            found.setdefault(path.name[len(DRAFT_LAYER_PREFIX):], path)
+    return found
+
+
+def restore_draft_layer(owner: str, slug: str, data_dir: Path,
+                        restore_mode: str = "copy", force: bool = False,
+                        min_experts_bytes: int = MIN_DRAFT_LAYER_BYTES) -> bool:
+    """Install the MTP draft layer (mtp/rt) from an attached public dataset.
+
+    The MTP layer is packed from the original BF16 checkpoint, not from a
+    quantization, so one copy serves every Qwen3.8-Flash-Next variant (Gyro,
+    Unsloth, Q2_0, IQ2_XS...). Restoring it avoids the ~5.2 GB fetch Strata
+    would otherwise repeat on every fresh Kaggle session.
+
+    Nothing but the draft layer is taken from the dataset: the model weights,
+    the pack and the tokenizer are variant-specific and must come from a
+    matching source.
+    """
+    if restore_mode not in {"copy", "symlink"}:
+        raise ValueError("restore_mode must be 'copy' or 'symlink'.")
+    if not force:
+        existing = mtp_layer_path(data_dir)
+        if existing is not None:
+            log("MTP draft layer already present at " + str(existing) + "; not restoring it again.")
+            return False
+    dataset_root: Path | None = None
+    entries: dict[str, Path] = {}
+    for candidate in _dataset_dirs(owner, slug):
+        entries = _draft_layer_entries(candidate)
+        if "experts.bin" in entries:
+            dataset_root = candidate
+            break
+    if dataset_root is None:
+        if not _dataset_dirs(owner, slug):
+            log("Draft-layer dataset " + owner + "/" + slug +
+                " is not attached; Strata will fetch the draft layer itself.")
+            return False
+        raise RuntimeError(
+            "No MTP draft layer found in " + owner + "/" + slug +
+            ": expected mtp/rt/experts.bin or " + DRAFT_LAYER_PREFIX + "experts.bin."
+        )
+
+    sizes = {name: src.stat().st_size for name, src in entries.items()}
+    if sizes["experts.bin"] < min_experts_bytes:
+        raise RuntimeError(
+            "The draft layer's experts.bin is only " + str(sizes["experts.bin"]) +
+            " bytes; at least " + str(min_experts_bytes) + " bytes are required for a real MTP layer."
+        )
+    unexpected = {n: s for n, s in sizes.items() if KNOWN_DRAFT_LAYER_SIZES.get(n, s) != s}
+    if unexpected:
+        log("Note: the draft layer came from a different Strata build than this helper knows "
+            + str(unexpected) + "; the engine will validate it at start.")
+
+    target = Path(data_dir) / "mtp" / "rt"
+    target.mkdir(parents=True, exist_ok=True)
+    total = sum(sizes.values())
+    log(f"Restoring the MTP draft layer ({len(entries)} files, {total / (1024**3):.2f} GiB) "
+        f"from {owner}/{slug} using {restore_mode} mode.")
+    for name, src in entries.items():
+        dst = target / name
+        size = sizes[name]
+        if restore_mode == "symlink":
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            if dst.is_symlink():
+                try:
+                    if dst.resolve(strict=True) == src.resolve(strict=True) and dst.stat().st_size == size:
+                        continue
+                except OSError:
+                    pass
+                dst.unlink()
+            elif dst.exists():
+                if dst.is_file() and dst.stat().st_size == size:
+                    continue
+                raise RuntimeError("Draft-layer target already exists with unexpected content: " + str(dst))
+            dst.symlink_to(src.resolve())
+        else:
+            _copy_verified(src, dst)
+    log("MTP draft layer installed at " + str(target) + ".")
+    return True
+
+
 def run_plan(family: str, variant: str, context: str, vision: str,
-             gpu_list: str, data_dir: Path) -> str:
+             gpu_list: str, data_dir: Path, drafting: str = "auto") -> str:
     cmd = ["strata", "launch", "--plan", "--family", family, "--model", variant,
            *_model_source_args(data_dir, family, variant), "--context", context, "--vision", vision,
-           "--mtp", "off", "--tune", "skip", "--access", "cloudflare",
+           *_drafting_args(drafting), "--tune", "skip", "--access", "cloudflare",
            "--port", "8080", "--gpu", gpu_list]
     result = run_streaming(cmd, timeout=300, check=False,
                            heartbeat_interval=15, heartbeat_label="Strata launch plan",
@@ -726,10 +907,11 @@ def run_plan(family: str, variant: str, context: str, vision: str,
 
 
 def launch_strata(family: str, variant: str, context: str, vision: str,
-                  gpu_list: str, data_dir: Path) -> str:
+                  gpu_list: str, data_dir: Path, drafting: str = "auto",
+                  access: str = "cloudflare") -> str:
     cmd = ["strata", "launch", "--family", family, "--model", variant,
            *_model_source_args(data_dir, family, variant), "--context", context, "--vision", vision,
-           "--mtp", "off", "--tune", "skip", "--access", "cloudflare",
+           *_drafting_args(drafting), "--tune", "skip", "--access", access,
            "--port", "8080", "--gpu", gpu_list, "--yes", "--no-tui"]
     log("Launching Strata. First-time model/engine downloads may take a while.")
     result = run_streaming(cmd, timeout=3600, check=False,
@@ -739,6 +921,91 @@ def launch_strata(family: str, variant: str, context: str, vision: str,
     if result.returncode:
         raise RuntimeError("Strata launch failed. Inspect the redacted output above.")
     return output
+
+
+def _local_model_id() -> str:
+    """The model ID the running local server advertises."""
+    import requests
+    key = _read_key()
+    response = requests.get("http://127.0.0.1:8080/v1/models",
+                            headers={"Authorization": "Bearer " + key}, timeout=30)
+    if not response.ok:
+        raise RuntimeError("Local /v1/models failed: HTTP " + str(response.status_code))
+    rows = response.json().get("data", [])
+    available = [x.get("id") for x in rows if isinstance(x, dict) and x.get("id")]
+    if not available:
+        raise RuntimeError("Strata did not advertise a model ID from /v1/models.")
+    return available[0]
+
+
+BENCH_PROMPT = (
+    "Write a short Python function that returns the sum of the squares of the "
+    "first n positive integers. Include a docstring."
+)
+
+
+def measure_generation(prompt: str = BENCH_PROMPT, max_tokens: int = 128,
+                       timeout: int = 900) -> dict[str, Any]:
+    """Send one fixed request to the local server and measure decode speed.
+
+    Wall time includes the first token, so longer answers give a steadier
+    number. This is a like-for-like comparison, not a benchmark of Strata.
+    """
+    import requests
+    key = _read_key()
+    payload = {
+        "model": _local_model_id(),
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": max_tokens,
+        "temperature": 0,
+        "reasoning_effort": "none",
+        "stream": False,
+    }
+    started = time.monotonic()
+    response = requests.post(
+        "http://127.0.0.1:8080/v1/chat/completions",
+        headers={"Authorization": "Bearer " + key, "Content-Type": "application/json"},
+        json=payload, timeout=timeout,
+    )
+    elapsed = time.monotonic() - started
+    if not response.ok:
+        raise RuntimeError("Benchmark request failed: HTTP " + str(response.status_code) + ": "
+                           + redact(response.text[:800]))
+    usage = response.json().get("usage") or {}
+    tokens = usage.get("completion_tokens")
+    if not isinstance(tokens, int) or tokens <= 0:
+        raise RuntimeError("The server did not report completion_tokens; cannot measure speed.")
+    return {"tokens": tokens, "seconds": round(elapsed, 3),
+            "tokens_per_second": round(tokens / elapsed, 2) if elapsed > 0 else 0.0}
+
+
+def compare_drafting(family: str, variant: str, context: str, vision: str,
+                     gpu_list: str, data_dir: Path,
+                     modes: tuple[str, ...] = ("off", "auto"),
+                     max_tokens: int = 128) -> dict[str, Any]:
+    """Measure the same prompt with and without the drafter.
+
+    Opt-in and slow: each mode reloads the model. No tunnel is created, and
+    the server is stopped at the end so the normal launch cell starts clean.
+    """
+    results: dict[str, Any] = {}
+    try:
+        for mode in modes:
+            log("Drafting A/B: stopping the server before the '" + mode + "' run.")
+            stop_strata()
+            launch_strata(family, variant, context, vision, gpu_list, data_dir,
+                          drafting=mode, access="local")
+            wait_health(timeout_seconds=1800)
+            measure_generation("Reply with one short sentence.", max_tokens=8)
+            results[mode] = measure_generation(max_tokens=max_tokens)
+            log("Drafting " + mode + ": " + str(results[mode]["tokens_per_second"]) + " tok/s")
+    finally:
+        stop_strata()
+    off = results.get("off", {}).get("tokens_per_second")
+    auto = results.get("auto", {}).get("tokens_per_second")
+    if off and auto:
+        results["auto_vs_off_percent"] = round((auto / off - 1) * 100, 1)
+    return results
 
 
 def install_cloudflared_if_missing() -> None:
@@ -943,17 +1210,30 @@ def _clean_stage(stage: Path) -> None:
 
 
 def upload_model_cache(data_dir: Path, username: str, slug: str, family: str, variant: str,
-                       env: dict[str, str], license_confirmed: bool, force: bool = False) -> bool:
+                       env: dict[str, str], license_confirmed: bool, force: bool = False,
+                       require_mtp: bool = False) -> bool:
     if not license_confirmed:
         log("Skipped model upload. Confirm the model terms and enable the explicit license flag first.")
         return False
+    layer = mtp_layer_path(data_dir)
+    if require_mtp and not layer:
+        raise RuntimeError(
+            "Drafting is enabled but the MTP draft layer is not under " + str(Path(data_dir) / "mtp" / "rt")
+            + ". Launch once with drafting='auto' (about " + str(MTP_FETCH_GB) + " GB) before uploading, "
+            "or set DRAFTING='off' to cache the model without it."
+        )
     attached = find_attached_dataset(username, slug, "manifest.json")
     if attached and not force:
         try:
             old = json.loads((attached / "manifest.json").read_text(encoding="utf-8"))
+            old_entries = old.get("files", [])
+            cache_has_mtp = any(
+                str(PurePosixPath(item.get("relative_path", ""))).startswith("mtp/")
+                for item in old_entries
+            )
             if (old.get("format") == "devzonex.strata-model-cache.v1"
-                    and old.get("model") == {"family": family, "variant": variant}):
-                old_entries = old.get("files", [])
+                    and old.get("model") == {"family": family, "variant": variant}
+                    and (cache_has_mtp or not require_mtp)):
                 cache_matches = bool(old_entries)
                 for item in old_entries:
                     rel = PurePosixPath(item["relative_path"])
@@ -978,6 +1258,10 @@ def upload_model_cache(data_dir: Path, username: str, slug: str, family: str, va
     )
     if not files:
         raise RuntimeError("No model/packs/mtp files found under " + str(data_dir) + ".")
+    if layer:
+        log("Including the MTP draft layer in the cache (" + str(layer) + ").")
+    else:
+        log("No MTP draft layer to cache; the next session will fetch it again if drafting is enabled.")
     sizes = {p.relative_to(data_dir).as_posix(): p.stat().st_size for p in files}
     stage = WORKING / "strata-model-dataset-stage"
     _clean_stage(stage)

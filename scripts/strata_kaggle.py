@@ -834,7 +834,9 @@ def serve_until_idle(idle_seconds: int = 900, serve_seconds: int = 0,
         raise ValueError("poll_seconds must be positive.")
     started = time.monotonic()
     deadline = started + serve_seconds if serve_seconds else None
+    stopper = stop or stop_strata
     if server_activity(key) is None and deadline is None:
+        stopper()
         raise RuntimeError(
             "The server does not report /v1/status activity, so an idle timeout cannot be "
             "detected. Set SERVE_MINUTES to bound the wait, or stop the session yourself.")
@@ -860,7 +862,7 @@ def serve_until_idle(idle_seconds: int = 900, serve_seconds: int = 0,
         pause = poll_seconds if deadline is None else min(poll_seconds, max(0.0, deadline - now))
         time.sleep(pause)
     elapsed = round(time.monotonic() - started, 1)
-    (stop or stop_strata)()
+    stopper()
     summary = {"reason": reason, "elapsed_seconds": elapsed, "idle_seconds": idle_seconds,
                "requests_served": requests_served, **session_identity()}
     print(SHUTDOWN_MARKER + json.dumps(summary), flush=True)

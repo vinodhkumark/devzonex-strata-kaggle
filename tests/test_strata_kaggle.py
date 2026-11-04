@@ -457,9 +457,12 @@ class SessionTests(unittest.TestCase):
             serve_until_idle(idle_seconds=0, serve_seconds=0)
 
     def test_serve_until_idle_needs_activity_or_a_deadline(self):
+        stopped = []
         with patch("scripts.strata_kaggle.server_activity", return_value=None):
             with self.assertRaises(RuntimeError):
-                serve_until_idle(idle_seconds=300, serve_seconds=0)
+                serve_until_idle(idle_seconds=300, serve_seconds=0,
+                                 stop=lambda: stopped.append(True))
+        self.assertEqual(stopped, [True])
 
 
 class QualityGateTests(unittest.TestCase):

@@ -239,8 +239,9 @@ writable layer. If a Kaggle dataset or model already holds
 `Qwen3.8-Flash-Next-Gyro-M-TQ2_0.gguf` (and its `.done` mark), attach it and set
 `MODEL_FILES_DATASET` to `owner/slug`, then run section 3c with
 `CPU_DOWNLOAD_MODEL = False` and `CPU_BUILD_PACK = True`. A model is mounted
-under `/kaggle/input/models/...`; the helper finds its version directory. The helper
-symlinks the GGUF from `/kaggle/input` and writes only `packs/` locally;
+under `/kaggle/input/models/...`; the helper finds its version directory. It
+symlinks the GGUF from `/kaggle/input` and writes only `packs/` locally — about
+32 GB for Gyro-M, because the low-RAM mode needs `experts.bin`.
 `UPLOAD_ADOPTED_MODEL_FILES` stays `False`, so the upload contains only the pack.
 Set `MODEL_VARIANT = "gyro-m"` in both notebooks.
 

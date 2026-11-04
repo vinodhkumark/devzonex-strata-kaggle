@@ -184,8 +184,10 @@ MODEL_RESTORE_MODE = "symlink"
 ```
 
 `adopt_model_bundle()` links the model from `/kaggle/input`, and section 3c
-builds only `packs/` locally. Keep `UPLOAD_ADOPTED_MODEL_FILES = False` so the
-model dataset you upload contains the pack, not a second 92 GB copy. The `.done`
+builds only `packs/` locally: the base pack plus `experts.bin` for the low-RAM
+mode, about **32 GB** for Gyro-M (the arena size; ~43 GB for IQ3_XXS). Keep
+`UPLOAD_ADOPTED_MODEL_FILES = False` so the model dataset you upload contains
+the pack, not a second 92 GB copy. The `.done`
 file is Strata's finish mark; `setup.download()` checks only that it exists.
 
 `MODEL_FILES_DATASET` accepts a Kaggle *model* too, not only a dataset. A model

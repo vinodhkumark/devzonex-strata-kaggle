@@ -1206,6 +1206,39 @@ class CpuPrepareTests(unittest.TestCase):
             self.assertTrue(summary["pack_ok"])
             self.assertEqual(summary["model_bytes"], 8)
 
+    def test_generated_script_writes_experts_bin_for_the_low_ram_mode(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            bundle = root / "input" / "bundle"
+            bundle.mkdir(parents=True)
+            (bundle / "model.gguf").write_bytes(b"g" * 8)
+            fake_setup = root / "setup.py"
+            fake_setup.write_text(
+                "from pathlib import Path\n"
+                "FAMILIES = {'gyro': {'tag': 'gyro-', 'hf': 'http://example.invalid/', 'file': '{q}.gguf'}}\n"
+                "def model_file(fam, model, i): return 'model.gguf'\n"
+                "def get_llama_cpp(): return '.'\n"
+                "def run(cmd, env=None):\n"
+                "    out = Path(cmd[cmd.index('--out') + 1])\n"
+                "    out.mkdir(parents=True, exist_ok=True)\n"
+                "    if '--experts-bin' in cmd:\n"
+                "        (out / 'experts.bin').write_bytes(b'e' * 4)\n"
+                "        return\n"
+                "    (out / 'tokenizer').mkdir(parents=True, exist_ok=True)\n"
+                "    (out / 'tokenizer' / 'vocab.json').write_text('{}')\n"
+                "    (out / 'native_experts.txt').write_text('')\n",
+                encoding="utf-8")
+            with patch.object(strata_kaggle, "WORKING", root / "working"), \
+                    patch.object(strata_kaggle, "find_strata_setup", return_value=fake_setup), \
+                    patch.object(strata_kaggle, "strata_terminal_python", return_value=sys.executable):
+                summary = prepare_model_on_cpu(
+                    root / "data", "gyro", "gyro-m",
+                    download_model=False, build_pack=True, fetch_draft=False,
+                    model_path=bundle, build_experts_bin=True)
+            self.assertEqual(summary["returncode"], 0)
+            self.assertTrue(summary["pack_ok"])
+            self.assertEqual(summary["experts_bin_bytes"], 4)
+
     def test_generated_script_accepts_a_lowercase_adopted_folder(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

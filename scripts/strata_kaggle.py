@@ -808,6 +808,23 @@ if config["build_pack"]:
 else:
     print("pack build skipped")
 
+if config.get("build_experts_bin") and config["build_pack"]:
+    if (pack_path / "experts.bin").is_file():
+        print("experts.bin already finished:", pack_path / "experts.bin")
+    else:
+        # The low-RAM mode maps one contiguous file instead of reading the
+        # sharded GGUF. A session with less RAM than the arena writes this at
+        # launch (one time); building it here keeps that off the GPU clock.
+        print("writing experts.bin for the low-RAM mode ...", flush=True)
+        try:
+            setup.run([sys.executable, str(package_root / "tools" / "iq_pack.py"),
+                       "--gguf", str(model_path), "--out", str(pack_path),
+                       "--experts-bin", *fam.get("pack_args", [])], env=env)
+        except SystemExit as exc:
+            warnings.append("experts.bin stopped (exit %s); the GPU session writes it at launch"
+                            % exc.code)
+            print("WARNING: " + warnings[-1], flush=True)
+
 if config["fetch_draft"]:
     if (draft_path / "experts.bin").is_file():
         print("draft layer already finished:", draft_path)
@@ -831,6 +848,8 @@ else:
     print("draft layer fetch skipped")
 
 result["model_bytes"] = model_path.stat().st_size if model_path.is_file() else 0
+result["experts_bin_bytes"] = ((pack_path / "experts.bin").stat().st_size
+                               if (pack_path / "experts.bin").is_file() else 0)
 result["pack_files"] = sum(1 for p in pack_path.rglob("*") if p.is_file()) if pack_path.is_dir() else 0
 result["draft_files"] = sum(1 for p in draft_path.rglob("*") if p.is_file()) if draft_path.is_dir() else 0
 result["pack_ok"] = pack_ok
@@ -849,6 +868,7 @@ def prepare_model_on_cpu(
     build_pack: bool = True,
     fetch_draft: bool = True,
     model_path: Path | None = None,
+    build_experts_bin: bool = False,
     timeout: int = 12 * 60 * 60,
 ) -> dict[str, Any]:
     """Download and prepare a model on a CPU-only session, without serving it.
@@ -887,6 +907,7 @@ def prepare_model_on_cpu(
         "build_pack": bool(build_pack),
         "fetch_draft": bool(fetch_draft),
         "model_path": str(model_path) if model_path else "",
+        "build_experts_bin": bool(build_experts_bin),
     }
     log("CPU preparation uses " + str(setup_py))
     log("Interpreter: " + python)

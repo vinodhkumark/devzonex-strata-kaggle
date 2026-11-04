@@ -665,7 +665,7 @@ setup = importlib.util.module_from_spec(spec)
 sys.modules["strata_setup"] = setup
 spec.loader.exec_module(setup)
 
-missing = [name for name in ("FAMILIES", "model_file", "get_llama_cpp")
+missing = [name for name in ("FAMILIES", "model_file")
            if not hasattr(setup, name)]
 if config["download_model"] and not hasattr(setup, "download"):
     missing.append("download")
@@ -703,11 +703,17 @@ else:
     print("model already present:", model_path)
 
 pack_ok = draft_ok = False
-try:
-    llama = setup.get_llama_cpp()
-    env = dict(os.environ, STRATA_GGUF_PY=str(Path(llama) / "gguf-py"))
-except SystemExit as exc:
-    warnings.append("llama.cpp's gguf-py is unavailable (exit %s)" % exc.code)
+if config["build_pack"] or config["fetch_draft"]:
+    if not hasattr(setup, "get_llama_cpp"):
+        raise SystemExit("this Strata build's setup.py has no get_llama_cpp; update Strata, "
+                         "or use the GPU session (section 4) instead")
+    try:
+        llama = setup.get_llama_cpp()
+        env = dict(os.environ, STRATA_GGUF_PY=str(Path(llama) / "gguf-py"))
+    except SystemExit as exc:
+        warnings.append("llama.cpp's gguf-py is unavailable (exit %s)" % exc.code)
+        env = dict(os.environ)
+else:
     env = dict(os.environ)
 
 if config["build_pack"]:

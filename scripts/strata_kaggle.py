@@ -1,6 +1,7 @@
 """Guided Kaggle helpers for running Strata-supported models safely."""
 from __future__ import annotations
 
+import base64
 import concurrent.futures
 import hashlib
 import json
@@ -11,6 +12,7 @@ import re
 import shutil
 import signal
 import queue
+import tempfile
 import threading
 import subprocess
 import sys
@@ -567,7 +569,11 @@ def restore_model_cache(owner: str, slug: str, data_dir: Path, workers: int = 8,
         rel = PurePosixPath(item["relative_path"])
         if rel.is_absolute() or ".." in rel.parts:
             raise RuntimeError("Unsafe path in model manifest: " + str(rel))
-        src = ds / item["dataset_name"]
+        dataset_name = PurePosixPath(str(item.get("dataset_name") or ""))
+        if not dataset_name.parts or dataset_name.is_absolute() or ".." in dataset_name.parts:
+            raise RuntimeError("Unsafe dataset file name in model manifest: "
+                               + str(item.get("dataset_name")))
+        src = ds.joinpath(*dataset_name.parts)
         dst = data_dir.joinpath(*rel.parts)
         size = int(item["size"])
         if not src.is_file() or src.stat().st_size != size:
@@ -768,6 +774,205 @@ def stop_strata() -> None:
     run_command(["strata", "launch", "--stop"], check=False, timeout=180)
 
 
+SESSION_MARKER = "STRATA_SESSION="
+SHUTDOWN_MARKER = "STRATA_SHUTDOWN="
+API_BASE = "http://127.0.0.1:8080/v1"
+
+
+def session_identity() -> dict[str, Any]:
+    """Identify the Kaggle kernel session that currently holds the GPU.
+
+    Kaggle names the container "<kernel>-<session>-webtier", so the number in the
+    middle is the session a launcher must cancel. Knowing it means a stop request
+    cannot hit a newer run that started after this one ended.
+    """
+    container = os.environ.get("KAGGLE_CONTAINER_NAME", "")
+    match = re.search(r"-(\d+)-webtier$", container)
+    return {"session_id": int(match.group(1)) if match else 0, "container": container}
+
+
+def announce_session(extra: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Print one machine-readable session record so a local launcher can find it."""
+    info = session_identity()
+    if extra:
+        info.update(extra)
+    print(SESSION_MARKER + json.dumps(info), flush=True)
+    return info
+
+
+def server_activity(key: str | None = None, base: str = API_BASE) -> dict[str, Any] | None:
+    """Return the server's request activity, or None when the endpoint is unavailable."""
+    import requests
+    try:
+        response = requests.get(base.rstrip("/") + "/status",
+                                headers={"Authorization": "Bearer " + _api_key(key)}, timeout=10)
+        if not response.ok:
+            return None
+        activity = response.json().get("activity")
+    except Exception:
+        return None
+    return activity if isinstance(activity, dict) else None
+
+
+def serve_until_idle(idle_seconds: int = 900, serve_seconds: int = 0,
+                     poll_seconds: float = 10.0, key: str | None = None,
+                     stop: Callable[[], None] | None = None) -> dict[str, Any]:
+    """Supervise the server, then stop it once the session is no longer in use.
+
+    Returning from this function is what lets the notebook finish, and a finished
+    notebook releases the GPU allocation — so call it from the last cell. Stopping
+    Strata first avoids leaving the engine holding VRAM while the session closes.
+
+    idle_seconds: finish after this long without a request (0 disables the check).
+    serve_seconds: hard limit for the whole wait (0 disables the limit).
+    """
+    if idle_seconds < 0 or serve_seconds < 0:
+        raise ValueError("idle_seconds and serve_seconds must not be negative.")
+    if idle_seconds == 0 and serve_seconds == 0:
+        raise ValueError("Set idle_seconds, serve_seconds, or both; refusing to wait forever.")
+    if poll_seconds <= 0:
+        raise ValueError("poll_seconds must be positive.")
+    started = time.monotonic()
+    deadline = started + serve_seconds if serve_seconds else None
+    if server_activity(key) is None and deadline is None:
+        raise RuntimeError(
+            "The server does not report /v1/status activity, so an idle timeout cannot be "
+            "detected. Set SERVE_MINUTES to bound the wait, or stop the session yourself.")
+    idle_since = started
+    signature: tuple[Any, Any] | None = None
+    requests_served = 0
+    reason = "serve_deadline"
+    while True:
+        now = time.monotonic()
+        if deadline is not None and now >= deadline:
+            reason = "serve_deadline"
+            break
+        activity = server_activity(key)
+        if activity is not None:
+            current = (activity.get("requests"), activity.get("last_request_at"))
+            if activity.get("in_flight") or (signature is not None and current != signature):
+                idle_since = now
+            signature = current
+            requests_served = int(activity.get("requests") or 0)
+            if idle_seconds and now - idle_since >= idle_seconds:
+                reason = "idle_timeout"
+                break
+        pause = poll_seconds if deadline is None else min(poll_seconds, max(0.0, deadline - now))
+        time.sleep(pause)
+    elapsed = round(time.monotonic() - started, 1)
+    (stop or stop_strata)()
+    summary = {"reason": reason, "elapsed_seconds": elapsed, "idle_seconds": idle_seconds,
+               "requests_served": requests_served, **session_identity()}
+    print(SHUTDOWN_MARKER + json.dumps(summary), flush=True)
+    log("Stopping the session after " + reason.replace("_", " ") + " (" + str(elapsed) + "s).")
+    return summary
+
+
+CONTEXT_CHOICES = {"8k": 8192, "16k": 16384, "32k": 32768, "65k": 65536, "128k": 131072}
+VISION_MODES = ("on", "off")
+RESTORE_MODES = ("copy", "symlink")
+
+
+def validate_config(family: str, variant: str, context: str, drafting: str = "auto",
+                    vision: str = "off", restore_mode: str = "copy",
+                    gpu_list: str = "") -> dict[str, Any]:
+    """Check the notebook configuration before a long launch spends GPU time.
+
+    Pure and side-effect free so it can be tested without Kaggle. Returns the
+    normalized values, including the context size in tokens.
+    """
+    family = (family or "").strip().lower()
+    variant = (variant or "").strip()
+    if not family:
+        raise ValueError("MODEL_FAMILY is empty; set the Strata family to run.")
+    if not variant:
+        raise ValueError("MODEL_VARIANT is empty; set the Strata model variant to run.")
+    context_key = (context or "").strip().lower()
+    if context_key not in CONTEXT_CHOICES:
+        raise ValueError("CONTEXT must be one of " + ", ".join(CONTEXT_CHOICES))
+    drafting = (drafting or "auto").strip().lower()
+    if drafting not in DRAFTING_MODES:
+        raise ValueError("DRAFTING must be one of " + ", ".join(DRAFTING_MODES))
+    vision = (vision or "off").strip().lower()
+    if vision not in VISION_MODES:
+        raise ValueError("VISION must be 'on' or 'off'.")
+    restore_mode = (restore_mode or "copy").strip().lower()
+    if restore_mode not in RESTORE_MODES:
+        raise ValueError("MODEL_RESTORE_MODE must be 'copy' or 'symlink'.")
+    gpu_list = (gpu_list or "").strip()
+    if gpu_list and not re.fullmatch(r"\d+(,\d+)*", gpu_list):
+        raise ValueError("GPU_IDS must be blank or a comma-separated list such as 0,1.")
+    return {"family": family, "variant": variant, "context": context_key,
+            "context_tokens": CONTEXT_CHOICES[context_key], "drafting": drafting,
+            "vision": vision, "restore_mode": restore_mode, "gpu_ids": gpu_list}
+
+
+def environment_report(require_cuda: bool = True) -> dict[str, Any]:
+    """Collect hardware facts and fail early when the session cannot run the model."""
+    report: dict[str, Any] = {"gpus": [], "ram_gb": None, "disk_free_gb": None,
+                              "cpu_count": os.cpu_count()}
+    if shutil.which("nvidia-smi"):
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=index,name,memory.total,compute_cap,driver_version",
+             "--format=csv,noheader,nounits"],
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False)
+        for line in (result.stdout or "").strip().splitlines():
+            parts = [part.strip() for part in line.split(",")]
+            if len(parts) < 5:
+                continue
+            try:
+                report["gpus"].append({"index": int(parts[0]), "name": parts[1],
+                                       "memory_mib": int(float(parts[2])),
+                                       "compute_capability": float(parts[3]),
+                                       "driver": parts[4]})
+            except ValueError:
+                continue
+    if require_cuda and not report["gpus"]:
+        raise RuntimeError("No NVIDIA GPU detected. Select a GPU accelerator in Kaggle settings.")
+    slow = [g for g in report["gpus"] if g["compute_capability"] < 7.0]
+    if slow:
+        raise RuntimeError("Compute capability below 7.0 is not supported: "
+                           + ", ".join(g["name"] for g in slow))
+    try:
+        meminfo = Path("/proc/meminfo").read_text(encoding="utf-8").splitlines()
+        total = next(line for line in meminfo if line.startswith("MemTotal:"))
+        report["ram_gb"] = round(int(total.split()[1]) / (1024 ** 2), 1)
+    except (OSError, StopIteration, ValueError, IndexError):
+        pass
+    try:
+        anchor = WORKING if WORKING.is_dir() else Path("/")
+        report["disk_free_gb"] = round(shutil.disk_usage(anchor).free / (1024 ** 3), 1)
+    except OSError:
+        pass
+    log("GPUs: " + (", ".join(g["name"] + " (" + str(g["memory_mib"]) + " MiB)" for g in report["gpus"])
+                    or "none") + "; RAM: " + str(report["ram_gb"]) + " GiB; free disk: "
+        + str(report["disk_free_gb"]) + " GiB")
+    return report
+
+
+def _preset_args(preset: str | None = None, save_preset: str | None = None) -> list[str]:
+    """Map notebook preset choices to Strata launch flags.
+
+    A preset keeps tuning, engine settings and context between sessions. Flags
+    next to --preset change that start only, so the notebook's family/model and
+    data directory still win over whatever the preset remembers.
+    """
+    args: list[str] = []
+    name = (preset or "").strip()
+    if name:
+        args += ["--preset", name]
+    saved = (save_preset or "").strip()
+    if saved:
+        args += ["--save-preset", saved]
+    return args
+
+
+def list_presets() -> str:
+    """Print the presets Strata has saved for this machine."""
+    result = run_command(["strata", "launch", "--list-presets"], check=False, timeout=120)
+    return result.stdout or ""
+
+
 #: Flattened file prefix used by public mirrors of a Strata data folder.
 DRAFT_LAYER_PREFIX = "mtp_rt__"
 #: Sizes of the packed draft layer in the build this helper was written against.
@@ -892,10 +1097,11 @@ def restore_draft_layer(owner: str, slug: str, data_dir: Path,
 
 
 def run_plan(family: str, variant: str, context: str, vision: str,
-             gpu_list: str, data_dir: Path, drafting: str = "auto") -> str:
+             gpu_list: str, data_dir: Path, drafting: str = "auto",
+             preset: str | None = None) -> str:
     cmd = ["strata", "launch", "--plan", "--family", family, "--model", variant,
            *_model_source_args(data_dir, family, variant), "--context", context, "--vision", vision,
-           *_drafting_args(drafting), "--tune", "skip", "--access", "cloudflare",
+           *_drafting_args(drafting), *_preset_args(preset), "--tune", "skip", "--access", "cloudflare",
            "--port", "8080", "--gpu", gpu_list]
     result = run_streaming(cmd, timeout=300, check=False,
                            heartbeat_interval=15, heartbeat_label="Strata launch plan",
@@ -908,10 +1114,11 @@ def run_plan(family: str, variant: str, context: str, vision: str,
 
 def launch_strata(family: str, variant: str, context: str, vision: str,
                   gpu_list: str, data_dir: Path, drafting: str = "auto",
-                  access: str = "cloudflare") -> str:
+                  access: str = "cloudflare", preset: str | None = None,
+                  save_preset: str | None = None) -> str:
     cmd = ["strata", "launch", "--family", family, "--model", variant,
            *_model_source_args(data_dir, family, variant), "--context", context, "--vision", vision,
-           *_drafting_args(drafting), "--tune", "skip", "--access", access,
+           *_drafting_args(drafting), *_preset_args(preset, save_preset), "--tune", "skip", "--access", access,
            "--port", "8080", "--gpu", gpu_list, "--yes", "--no-tui"]
     log("Launching Strata. First-time model/engine downloads may take a while.")
     result = run_streaming(cmd, timeout=3600, check=False,
@@ -1008,6 +1215,280 @@ def compare_drafting(family: str, variant: str, context: str, vision: str,
     return results
 
 
+QUALITY_SIZES = (128, 512, 2048)
+
+
+def _number(value: Any) -> float | None:
+    try:
+        return round(float(value), 2)
+    except (TypeError, ValueError):
+        return None
+
+
+def discover_model(base: str = API_BASE, key: str | None = None) -> str:
+    """The model ID the server advertises at /v1/models."""
+    import requests
+    response = requests.get(base.rstrip("/") + "/models",
+                            headers={"Authorization": "Bearer " + _api_key(key)}, timeout=30)
+    if not response.ok:
+        raise RuntimeError("GET /v1/models failed: HTTP " + str(response.status_code))
+    rows = [row for row in response.json().get("data", [])
+            if isinstance(row, dict) and row.get("id")]
+    if not rows:
+        raise RuntimeError("Strata advertised no model ID from /v1/models.")
+    return rows[0]["id"]
+
+
+def stream_chat(messages: list[dict[str, Any]], *, model: str | None = None,
+                max_tokens: int = 128, temperature: float = 0.0,
+                tools: list[dict[str, Any]] | None = None,
+                key: str | None = None, base: str = API_BASE,
+                timeout: int = 900) -> dict[str, Any]:
+    """Send one streaming chat request and collect the whole answer.
+
+    Streamed responses are what agent clients use, so measuring them exercises
+    the same path: token timings, tool calls split across deltas, and TTFT.
+    """
+    import requests
+    key_value = _api_key(key)
+    base_url = base.rstrip("/")
+    payload: dict[str, Any] = {
+        "model": model or discover_model(base_url, key_value),
+        "messages": messages, "max_tokens": max_tokens, "temperature": temperature,
+        "reasoning_effort": "none", "stream": True,
+    }
+    if tools:
+        payload["tools"] = tools
+    started = time.monotonic()
+    first_token: float | None = None
+    content: list[str] = []
+    calls: dict[int, dict[str, Any]] = {}
+    usage: dict[str, Any] = {}
+    timings: dict[str, Any] = {}
+    finish_reason = None
+    done = False
+    with requests.post(base_url + "/chat/completions",
+                       headers={"Authorization": "Bearer " + key_value,
+                                "Content-Type": "application/json"},
+                       json=payload, stream=True, timeout=timeout) as response:
+        if not response.ok:
+            raise RuntimeError("Chat request failed: HTTP " + str(response.status_code) + ": "
+                               + redact(response.text[:800]))
+        for raw in response.iter_lines(decode_unicode=True):
+            if not raw:
+                continue
+            line = raw.strip()
+            if not line.startswith("data:"):
+                continue
+            data = line[5:].strip()
+            if data == "[DONE]":
+                done = True
+                break
+            event = json.loads(data)
+            if event.get("error"):
+                raise RuntimeError("The server returned an error while streaming: "
+                                   + redact(str(event["error"])[:800]))
+            if event.get("usage"):
+                usage = event["usage"]
+            if event.get("timings"):
+                timings = event["timings"]
+            for choice in event.get("choices") or []:
+                delta = choice.get("delta") or {}
+                if first_token is None and any(delta.get(name) for name in
+                                               ("content", "reasoning_content", "tool_calls")):
+                    first_token = time.monotonic() - started
+                if delta.get("content"):
+                    content.append(delta["content"])
+                if choice.get("finish_reason"):
+                    finish_reason = choice["finish_reason"]
+                for part in delta.get("tool_calls") or []:
+                    index = int(part.get("index") or 0)
+                    call = calls.setdefault(index, {"id": "", "type": "function",
+                                                    "function": {"name": "", "arguments": ""}})
+                    call["id"] += part.get("id") or ""
+                    function = part.get("function") or {}
+                    call["function"]["name"] += function.get("name") or ""
+                    call["function"]["arguments"] += function.get("arguments") or ""
+    if finish_reason is None and not done:
+        raise RuntimeError("The streamed response ended before completion.")
+    message: dict[str, Any] = {"role": "assistant", "content": "".join(content) or None}
+    if calls:
+        message["tool_calls"] = [calls[index] for index in sorted(calls)]
+    return {"message": message, "tool_calls": message.get("tool_calls", []),
+            "usage": usage, "timings": timings, "finish_reason": finish_reason,
+            "ttft_s": round(first_token, 3) if first_token is not None else None,
+            "elapsed_s": round(time.monotonic() - started, 3)}
+
+
+def benchmark_api(words: tuple[int, ...] = QUALITY_SIZES, repeats: int = 1,
+                  max_tokens: int = 128) -> dict[str, Any]:
+    """Measure prompt processing and decode speed through the real chat API.
+
+    Rates come from the server's own timings when it reports them, and fall back
+    to token counts divided by wall time otherwise. Prompts are synthetic and the
+    answers are short, so treat this as a like-for-like comparison, not a
+    benchmark of the engine.
+    """
+    if repeats < 1:
+        raise ValueError("repeats must be at least 1.")
+    if any(size < 1 for size in words):
+        raise ValueError("word counts must be positive.")
+    runs: list[dict[str, Any]] = []
+    for size in words:
+        for _ in range(repeats):
+            prompt = ("Request " + str(time.time_ns()) + ".\n" + " ".join(["item"] * size)
+                      + "\nWrite a Python function that counts the listed items. Explain briefly.")
+            result = stream_chat([{"role": "user", "content": prompt}], max_tokens=max_tokens)
+            usage, timings = result["usage"], result["timings"]
+            prompt_tokens = usage.get("prompt_tokens")
+            generated = usage.get("completion_tokens")
+            row: dict[str, Any] = {
+                "prompt_words": size,
+                "prompt_tokens": prompt_tokens,
+                "generated_tokens": generated,
+                "ttft_s": result["ttft_s"],
+                "elapsed_s": result["elapsed_s"],
+                "prompt_tokens_per_second": _number(timings.get("prompt_per_second")),
+                "generation_tokens_per_second": _number(timings.get("predicted_per_second")),
+            }
+            if row["prompt_tokens_per_second"] is None and prompt_tokens:
+                prefill = result["ttft_s"] or result["elapsed_s"]
+                if prefill:
+                    row["prompt_tokens_per_second"] = round(prompt_tokens / prefill, 2)
+            if row["generation_tokens_per_second"] is None and generated:
+                decode = result["elapsed_s"] - (result["ttft_s"] or 0)
+                if decode > 0:
+                    row["generation_tokens_per_second"] = round(generated / decode, 2)
+            runs.append(row)
+            log(str(size) + " words: prompt " + str(row["prompt_tokens_per_second"]) + " tok/s, "
+                "decode " + str(row["generation_tokens_per_second"]) + " tok/s, TTFT "
+                + str(row["ttft_s"]) + "s")
+    return {"runs": runs, "summary": _benchmark_summary(runs)}
+
+
+def _benchmark_summary(runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    summary: list[dict[str, Any]] = []
+    for size in sorted({row["prompt_words"] for row in runs}):
+        group = [row for row in runs if row["prompt_words"] == size]
+        entry: dict[str, Any] = {"prompt_words": size, "samples": len(group)}
+        for field in ("prompt_tokens_per_second", "generation_tokens_per_second", "ttft_s"):
+            values = [row[field] for row in group if isinstance(row.get(field), (int, float))]
+            entry[field] = round(sum(values) / len(values), 2) if values else None
+        summary.append(entry)
+    return summary
+
+
+SMOKE_TOOLS = [
+    {"type": "function", "function": {
+        "name": "read_file", "description": "Read the local file answer.py.",
+        "parameters": {"type": "object", "properties": {}, "additionalProperties": False}}},
+    {"type": "function", "function": {
+        "name": "write_file",
+        "description": "Replace the local file answer.py with the supplied Python source.",
+        "parameters": {"type": "object", "properties": {"content": {"type": "string"}},
+                       "required": ["content"], "additionalProperties": False}}},
+    {"type": "function", "function": {
+        "name": "run_test", "description": "Run the local command that checks answer.py.",
+        "parameters": {"type": "object", "properties": {}, "additionalProperties": False}}},
+]
+
+
+def agent_smoke(rounds: int = 12, repeats: int = 1) -> dict[str, Any]:
+    """Check that the model can read, edit and test a local file through tools.
+
+    Adapted from Ninnix/sok (MIT). This is the quality gate that matters for an
+    agent: a model can generate fluent tokens and still fail to emit a valid tool
+    call, edit before reading, or claim success without running the test.
+    """
+    if rounds < 1 or repeats < 1:
+        raise ValueError("rounds and repeats must be at least 1.")
+    runs: list[dict[str, Any]] = []
+    for _ in range(repeats):
+        started = time.monotonic()
+        runs.append(_agent_task(rounds))
+        runs[-1]["elapsed_s"] = round(time.monotonic() - started, 2)
+        log("Agent smoke: completed in " + str(runs[-1]["turns"]) + " turns, "
+            + str(runs[-1]["elapsed_s"]) + "s")
+    return {"runs": runs, "ok": all(run["ok"] for run in runs)}
+
+
+def _agent_task(rounds: int) -> dict[str, Any]:
+    messages: list[dict[str, Any]] = [
+        {"role": "system", "content": "You are a coding agent. Use the available local tools to "
+                                      "complete the task. Read the file before editing it, then run "
+                                      "the test. Do not claim success until the test passes."},
+        {"role": "user", "content": "Fix answer.py so that answer() returns 42. Read it, edit it, "
+                                    "run the test, then briefly report the result."},
+    ]
+    seen: list[str] = []
+    passed = False
+    with tempfile.TemporaryDirectory(prefix="strata-agent-") as folder:
+        path = Path(folder) / "answer.py"
+        path.write_text("def answer():\n    return 41\n", encoding="utf-8")
+        for turn in range(rounds):
+            result = stream_chat(messages, max_tokens=512, tools=SMOKE_TOOLS)
+            messages.append(result["message"])
+            calls = result["tool_calls"]
+            if not calls:
+                if passed and all(name in seen for name in ("read_file", "write_file", "run_test")):
+                    return {"ok": True, "turns": turn + 1, "local_tools": seen}
+                messages.append({"role": "user",
+                                 "content": "Use read_file, write_file and run_test before finishing."})
+                continue
+            for call in calls:
+                name = (call.get("function") or {}).get("name")
+                try:
+                    arguments = json.loads((call.get("function") or {}).get("arguments") or "{}")
+                except ValueError:
+                    raise RuntimeError("The model emitted arguments that are not valid JSON.")
+                if name == "read_file" and not arguments:
+                    output = path.read_text(encoding="utf-8")
+                elif name == "write_file" and set(arguments) == {"content"} and "read_file" in seen:
+                    path.write_text(str(arguments["content"]), encoding="utf-8")
+                    passed = False
+                    output = "answer.py updated"
+                elif name == "run_test" and not arguments:
+                    passed, output = _run_smoke_test(folder, path)
+                else:
+                    raise RuntimeError("Invalid tool call, or an edit attempted before reading the file.")
+                seen.append(name)
+                messages.append({"role": "tool", "tool_call_id": call.get("id") or "",
+                                 "content": output})
+    raise RuntimeError("The agent did not finish the task within " + str(rounds) + " turns.")
+
+
+def _run_smoke_test(folder: str, path: Path) -> tuple[bool, str]:
+    """Run the fixed check with credentials stripped from the child environment."""
+    env = {name: value for name, value in os.environ.items()
+           if not any(word in name.upper() for word in ("KEY", "TOKEN", "SECRET", "PASSWORD"))}
+    result = subprocess.run(
+        [sys.executable, "-I", "-c",
+         "import runpy; assert runpy.run_path('answer.py')['answer']() == 42; print('PASS')"],
+        cwd=folder, env=env, capture_output=True, text=True, timeout=10, check=False)
+    ok = result.returncode == 0 and path.read_text(encoding="utf-8").find("42") >= 0
+    return ok, json.dumps({"exit_code": result.returncode, "stdout": result.stdout,
+                           "stderr": result.stderr})
+
+
+def run_quality_gate(words: tuple[int, ...] = QUALITY_SIZES, repeats: int = 1,
+                     agent_repeats: int = 1) -> dict[str, Any]:
+    """Benchmark the API and check tool calling on the running server."""
+    log("Quality gate: benchmarking the chat API…")
+    benchmark = benchmark_api(words, repeats)
+    log("Quality gate: checking local tool calling…")
+    smoke = agent_smoke(repeats=agent_repeats)
+    for row in benchmark["summary"]:
+        print(str(row["prompt_words"]).rjust(5) + " words  prompt "
+              + str(row["prompt_tokens_per_second"]).rjust(7) + " tok/s  decode "
+              + str(row["generation_tokens_per_second"]).rjust(6) + " tok/s  TTFT "
+              + str(row["ttft_s"]).rjust(5) + "s  (" + str(row["samples"]) + " samples)",
+              flush=True)
+    print("Tool calling: " + ("PASS" if smoke["ok"] else "FAIL")
+          + " in " + str(smoke["runs"][0]["turns"]) + " turns "
+          + "(" + str(smoke["runs"][0]["elapsed_s"]) + "s)", flush=True)
+    return {"benchmark": benchmark, "agent_smoke": smoke}
+
+
 def install_cloudflared_if_missing() -> None:
     os.environ["PATH"] = "/root/.local/bin:" + os.environ.get("PATH", "")
     if shutil.which("cloudflared"):
@@ -1039,6 +1520,11 @@ def _read_key() -> str:
     if not match:
         raise RuntimeError("Could not safely identify the Strata API key.")
     return match.group(0)
+
+
+def _api_key(key: str | None = None) -> str:
+    """Use a caller-supplied key when given, otherwise ask Strata for the running one."""
+    return key or _read_key()
 
 
 def wait_health(timeout_seconds: int = 900) -> dict[str, Any]:
@@ -1141,6 +1627,50 @@ def verify_public_endpoint(public_url: str, expected_model: str | None = None) -
     print("API key was not printed. Retrieve it privately using: strata launch --show-key")
     return {"model_id": model_id, "url": base, "unauthenticated_status": unauth.status_code,
             "authenticated_status": chat.status_code}
+
+
+CONNECTION_MARKER = "STRATA_CONNECTION="
+
+
+def publish_connection(public_url: str, *, client_public_key: str | None = None,
+                       api_key: str | None = None,
+                       model: str | None = None) -> dict[str, Any]:
+    """Print a machine-readable connection record for a local launcher.
+
+    With a client public key the API key is encrypted with RSA-OAEP/SHA-256, so
+    the key never appears in the notebook output or in Kaggle Secrets. Without
+    one, only the URL is published and the key stays where Strata keeps it.
+    """
+    connection: dict[str, Any] = {"base_url": public_url.rstrip("/"),
+                                  "model": model or _local_model_id(),
+                                  **session_identity()}
+    if client_public_key:
+        if not client_public_key.strip().startswith("-----BEGIN PUBLIC KEY-----"):
+            raise ValueError("client_public_key must be a PEM RSA public key.")
+        openssl = shutil.which("openssl")
+        if not openssl:
+            raise RuntimeError("OpenSSL is required to encrypt the API key for the client.")
+        with tempfile.NamedTemporaryFile("w", suffix=".pem", delete=False) as handle:
+            handle.write(client_public_key)
+            pem = Path(handle.name)
+        try:
+            result = subprocess.run(
+                [openssl, "pkeyutl", "-encrypt", "-pubin", "-inkey", str(pem),
+                 "-pkeyopt", "rsa_padding_mode:oaep",
+                 "-pkeyopt", "rsa_oaep_md:sha256",
+                 "-pkeyopt", "rsa_mgf1_md:sha256"],
+                input=_api_key(api_key).encode(), stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, check=False)
+        finally:
+            pem.unlink(missing_ok=True)
+        if result.returncode != 0:
+            raise RuntimeError("OpenSSL could not encrypt the API key: "
+                               + redact(result.stderr.decode("utf-8", "replace")[:400]))
+        connection["encrypted_api_key"] = base64.b64encode(result.stdout).decode()
+    else:
+        connection["api_key"] = "not published; retrieve it with: strata launch --show-key"
+    print(CONNECTION_MARKER + json.dumps(connection), flush=True)
+    return connection
 
 
 def _sha256(path: Path) -> str:
@@ -1331,17 +1861,26 @@ def upload_runtime_cache(username: str, slug: str, env: dict[str, str], force: b
     return True
 
 
-def opencode_config_snippet(public_url: str, model_id: str,
-                            provider_package: str = "@opencode/ai/providers/openai-compatible") -> str:
+def opencode_config_snippet(public_url: str, model_id: str, context_tokens: int = 32768,
+                            output_tokens: int = 8192,
+                            provider_package: str = "@opencode/ai/providers/openai-compatible",
+                            key_path: str = "~/.config/opencode/strata-key.txt") -> str:
+    """Build the provider entry to merge into OpenCode's providers map.
+
+    A T4 can take minutes to the first token and pause mid-answer while the
+    engine pages experts, so the timeouts are 15 minutes rather than OpenCode's
+    shorter defaults. `compatibility.reasoningField` keeps Strata's separate
+    reasoning channel out of the answer text.
+    """
     provider = {
         "name": "Strata Kaggle", "package": provider_package,
         "settings": {"baseURL": public_url.rstrip("/") + "/v1",
-                     "apiKey": "{file:~/.config/opencode/strata-key.txt}",
-                     "encoding": "none", "timeout": 600000, "headerTimeout": 120000,
-                     "chunkTimeout": 300000},
-        "models": {model_id: {"name": model_id, "modelID": model_id,
-                              "reasoningEffort": "none",
-                              "capabilities": {"tools": True, "input": ["text"], "output": ["text"]},
-                              "limit": {"context": 32768, "output": 8192}}},
+                     "apiKey": "{file:" + key_path + "}",
+                     "encoding": "none", "headerTimeout": 900000, "chunkTimeout": 900000},
+        "models": {model_id: {
+            "name": model_id, "modelID": model_id,
+            "capabilities": {"tools": True, "input": ["text"], "output": ["text"]},
+            "compatibility": {"reasoningField": "reasoning_content"},
+            "limit": {"context": int(context_tokens), "output": int(output_tokens)}}},
     }
     return json.dumps({"strata": provider}, indent=2)

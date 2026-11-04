@@ -235,9 +235,11 @@ same rotation to try another model, because two ~58 GB models cannot coexist in
 one session. Each model has its own dataset; attach only the one you are serving.
 
 **Gyro-M does not fit at all.** Its GGUF is 91.97 GB, larger than the whole
-writable layer. If a dataset already holds `Qwen3.8-Flash-Next-Gyro-M-TQ2_0.gguf`
-(and its `.done` mark), attach it and set `MODEL_FILES_DATASET`, then run section
-3c with `CPU_DOWNLOAD_MODEL = False` and `CPU_BUILD_PACK = True`. The helper
+writable layer. If a Kaggle dataset or model already holds
+`Qwen3.8-Flash-Next-Gyro-M-TQ2_0.gguf` (and its `.done` mark), attach it and set
+`MODEL_FILES_DATASET` to `owner/slug`, then run section 3c with
+`CPU_DOWNLOAD_MODEL = False` and `CPU_BUILD_PACK = True`. A model is mounted
+under `/kaggle/input/models/...`; the helper finds its version directory. The helper
 symlinks the GGUF from `/kaggle/input` and writes only `packs/` locally;
 `UPLOAD_ADOPTED_MODEL_FILES` stays `False`, so the upload contains only the pack.
 Set `MODEL_VARIANT = "gyro-m"` in both notebooks.

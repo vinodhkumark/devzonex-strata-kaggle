@@ -850,6 +850,39 @@ class ModelBundleTests(unittest.TestCase):
                                        restore_mode="copy")
             self.assertIn("symlink", str(caught.exception))
 
+    def test_a_kaggle_model_mount_is_found_by_owner_and_slug(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            input_root = root / "input" / "datasets"
+            version = (root / "input" / "models" / "buianhtruc"
+                       / "strata-qwen3-8-flash-next-gyro-m-tq2-0"
+                       / "gguf" / "default" / "1")
+            version.mkdir(parents=True)
+            (version / "Qwen3.8-Flash-Next-Gyro-M-TQ2_0.gguf").write_bytes(b"g" * 8)
+            (version / "Qwen3.8-Flash-Next-Gyro-M-TQ2_0.gguf.done").write_text("done")
+            with patch.object(strata_kaggle, "INPUT_ROOT", input_root):
+                found = find_attached_dataset(
+                    "buianhtruc", "strata-qwen3-8-flash-next-gyro-m-tq2-0")
+            self.assertEqual(found, version)
+
+    def test_an_attached_kaggle_model_can_be_adopted(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            input_root = root / "input" / "datasets"
+            version = (root / "input" / "models" / "buianhtruc"
+                       / "strata-qwen3-8-flash-next-gyro-m-tq2-0"
+                       / "gguf" / "default" / "1")
+            version.mkdir(parents=True)
+            (version / "Qwen3.8-Flash-Next-Gyro-M-TQ2_0.gguf").write_bytes(b"g" * 8)
+            (version / "Qwen3.8-Flash-Next-Gyro-M-TQ2_0.gguf.done").write_text("done")
+            with patch.object(strata_kaggle, "INPUT_ROOT", input_root):
+                target = adopt_model_bundle(
+                    "buianhtruc", "strata-qwen3-8-flash-next-gyro-m-tq2-0",
+                    root / "local", "gyro", "gyro-m")
+            self.assertTrue((target / "Qwen3.8-Flash-Next-Gyro-M-TQ2_0.gguf").is_symlink())
+            self.assertEqual((target / "Qwen3.8-Flash-Next-Gyro-M-TQ2_0.gguf").read_bytes(),
+                             b"g" * 8)
+
     def test_adopting_a_missing_dataset_explains_what_to_do(self):
         with tempfile.TemporaryDirectory() as td:
             input_root = Path(td) / "input" / "datasets"

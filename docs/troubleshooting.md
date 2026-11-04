@@ -188,6 +188,10 @@ builds only `packs/` locally. Keep `UPLOAD_ADOPTED_MODEL_FILES = False` so the
 model dataset you upload contains the pack, not a second 92 GB copy. The `.done`
 file is Strata's finish mark; `setup.download()` checks only that it exists.
 
+`MODEL_FILES_DATASET` accepts a Kaggle *model* too, not only a dataset. A model
+is mounted at `/kaggle/input/models/<owner>/<slug>/gguf/default/1`; give
+`owner/slug` and the helper finds the version directory with the GGUF.
+
 ## The draft layer is restored from the wrong dataset
 
 The MTP layer lives in its own dataset, `<your-username>/strata-mtp-rt`, and is

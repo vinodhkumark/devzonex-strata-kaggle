@@ -273,11 +273,45 @@ def _dataset_roots() -> list[Path]:
     return roots
 
 
+def _model_mount_dirs(owner: str, slug: str) -> list[Path]:
+    """Directories of an attached Kaggle *model* that hold its files.
+
+    Kaggle mounts a model as
+    ``/kaggle/input/models/<owner>/<slug>/<framework>/<variation>/<version>``.
+    It is a read-only mount like a dataset and costs nothing on the writable
+    layer, but the dataset layouts below do not cover it.
+    """
+    parent = INPUT_ROOT.parent
+    if parent == INPUT_ROOT:
+        return []
+    base = parent / "models" / owner / slug
+    if not base.is_dir():
+        return []
+    try:
+        candidates = [base]
+        candidates += sorted(path for path in base.rglob("*") if path.is_dir())
+    except OSError:
+        candidates = [base]
+    found: list[Path] = []
+    for path in candidates:
+        try:
+            has_model = any(entry.is_file() and entry.suffix == ".gguf"
+                            for entry in path.iterdir())
+        except OSError:
+            continue
+        if has_model and path not in found:
+            found.append(path)
+    return found
+
+
 def find_attached_dataset(owner: str, slug: str, marker: str | None = None) -> Path | None:
     for root in _dataset_roots():
         for candidate in (root / owner / slug, root / slug):
             if candidate.is_dir() and (marker is None or (candidate / marker).is_file()):
                 return candidate
+    for candidate in _model_mount_dirs(owner, slug):
+        if marker is None or (candidate / marker).is_file():
+            return candidate
     marker_name = marker or "dataset-metadata.json"
     for root in _dataset_roots():
         if not root.is_dir():

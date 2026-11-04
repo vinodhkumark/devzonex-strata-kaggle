@@ -2,6 +2,7 @@ import os
 import hashlib
 import contextlib
 import io
+import json
 import sys
 import tempfile
 import tarfile
@@ -16,6 +17,7 @@ from scripts.strata_kaggle import (agent_smoke, benchmark_api, environment_repor
                                    publish_connection, session_identity, serve_until_idle,
                                    validate_config)
 from scripts.strata_kaggle import find_attached_dataset, attached_datasets, dataset_mount_report
+from scripts.strata_kaggle import find_model_cache, describe_inputs
 
 
 class StrataKaggleTests(unittest.TestCase):
@@ -674,6 +676,103 @@ class DatasetMountTests(unittest.TestCase):
                                                Path(td) / "local", min_experts_bytes=1)
             self.assertTrue(restored)
             self.assertTrue((Path(td) / "local" / "mtp" / "rt" / "experts.bin").is_file())
+
+
+class ModelDiscoveryTests(unittest.TestCase):
+    def _manifest(self, entries, family="gyro", variant="gyro-s"):
+        return {"format": "devzonex.strata-model-cache.v1",
+                "model": {"family": family, "variant": variant},
+                "files": entries}
+
+    def test_model_cache_is_found_inside_another_dataset(self):
+        # A dataset named after the runtime cache can also carry the model cache.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            input_root = root / "input" / "datasets"
+            dataset = input_root / "owner" / "strata-runtime-cache"
+            dataset.mkdir(parents=True)
+            (dataset / "dataset-metadata.json").write_text("{}", encoding="utf-8")
+            payload = b"weights-in-runtime-dataset"
+            (dataset / "0001__model.gguf").write_bytes(payload)
+            (dataset / "manifest.json").write_text(json.dumps(self._manifest([
+                {"dataset_name": "0001__model.gguf",
+                 "relative_path": "models/gyro-Gyro-S/model.gguf", "size": len(payload)}])),
+                encoding="utf-8")
+            with patch("scripts.strata_kaggle.INPUT_ROOT", input_root):
+                restored = restore_model_cache("owner", "strata-model-gyro-gyro-s",
+                                               root / "local", family="gyro",
+                                               variant="gyro-s", restore_mode="copy")
+            self.assertTrue(restored)
+            self.assertEqual(
+                (root / "local" / "models" / "gyro-Gyro-S" / "model.gguf").read_bytes(), payload)
+
+    def test_manifest_one_level_down_finds_files_at_the_dataset_root(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            input_root = root / "input" / "datasets"
+            dataset = input_root / "owner" / "strata-runtime-cache"
+            nested = dataset / "strata-model-gyro-gyro-s"
+            nested.mkdir(parents=True)
+            payload = b"nested-manifest"
+            (dataset / "0001__model.gguf").write_bytes(payload)
+            (nested / "manifest.json").write_text(json.dumps(self._manifest([
+                {"dataset_name": "0001__model.gguf",
+                 "relative_path": "models/gyro-Gyro-S/model.gguf", "size": len(payload)}])),
+                encoding="utf-8")
+            with patch("scripts.strata_kaggle.INPUT_ROOT", input_root):
+                found = find_model_cache("owner", "strata-model-gyro-gyro-s")
+            self.assertIsNotNone(found)
+            self.assertEqual(found[1], nested)
+            self.assertEqual(found[2]["format"], "devzonex.strata-model-cache.v1")
+
+    def test_a_dataset_without_a_model_manifest_is_ignored(self):
+        with tempfile.TemporaryDirectory() as td:
+            input_root = Path(td) / "input" / "datasets"
+            dataset = input_root / "owner" / "strata-runtime-cache"
+            dataset.mkdir(parents=True)
+            (dataset / "manifest.json").write_text(json.dumps({"format": "something-else"}),
+                                                   encoding="utf-8")
+            with patch("scripts.strata_kaggle.INPUT_ROOT", input_root):
+                self.assertIsNone(find_model_cache("owner", "strata-model-gyro-gyro-s"))
+
+    def test_the_expected_dataset_wins_over_another_one(self):
+        with tempfile.TemporaryDirectory() as td:
+            input_root = Path(td) / "input" / "datasets"
+            expected = input_root / "owner" / "strata-model-gyro-gyro-s"
+            other = input_root / "owner" / "strata-runtime-cache"
+            for path in (expected, other):
+                path.mkdir(parents=True)
+                (path / "manifest.json").write_text(
+                    json.dumps(self._manifest([])), encoding="utf-8")
+            with patch("scripts.strata_kaggle.INPUT_ROOT", input_root):
+                found = find_model_cache("owner", "strata-model-gyro-gyro-s")
+            self.assertEqual(found[0], expected)
+
+
+    def test_describe_inputs_reports_what_each_dataset_holds(self):
+        with tempfile.TemporaryDirectory() as td:
+            input_root = Path(td) / "input" / "datasets"
+            runtime = input_root / "strata-runtime-cache"
+            runtime.mkdir(parents=True)
+            (runtime / "dataset-metadata.json").write_text("{}", encoding="utf-8")
+            (runtime / "strata-runtime-cache.bin").write_bytes(b"r" * 100)
+            model = input_root / "alpha-orionis-xs-betelgeuse"
+            model.mkdir(parents=True)
+            (model / "dataset-metadata.json").write_text("{}", encoding="utf-8")
+            payload = b"w" * 50
+            (model / "0001__model.gguf").write_bytes(payload)
+            (model / "manifest.json").write_text(json.dumps({
+                "format": "devzonex.strata-model-cache.v1",
+                "model": {"family": "gyro", "variant": "gyro-s"},
+                "files": [{"dataset_name": "0001__model.gguf",
+                           "relative_path": "models/gyro-Gyro-S/model.gguf",
+                           "size": len(payload)}]}), encoding="utf-8")
+            with patch("scripts.strata_kaggle.INPUT_ROOT", input_root):
+                report = {entry["name"]: entry for entry in describe_inputs()}
+            self.assertIn("runtime_cache_gib", report["strata-runtime-cache"])
+            self.assertEqual(report["alpha-orionis-xs-betelgeuse"]["model_cache"]["family"],
+                             "gyro")
+            self.assertEqual(report["alpha-orionis-xs-betelgeuse"]["model_cache"]["files"], 1)
 
 
 if __name__ == "__main__":

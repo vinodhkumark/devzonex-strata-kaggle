@@ -51,6 +51,32 @@ The report lists the roots that were searched and every dataset directory found,
 without reading the dataset's files. A model cache also needs `manifest.json` at
 the dataset's top level; a runtime cache needs `strata-runtime-cache.bin`.
 
+## The caches are in a differently named dataset
+
+The notebook derives the model dataset name from `MODEL_FAMILY` and
+`MODEL_VARIANT`, so `gyro`/`gyro-s` means `strata-model-gyro-gyro-s`. A dataset
+mounted under any other name is still used when it contains a valid
+`manifest.json` with `"format": "devzonex.strata-model-cache.v1"`, either at its
+top level or one directory down. The log then names the dataset it used.
+
+To see what each mounted dataset holds:
+
+```python
+import scripts.strata_kaggle as sk
+for entry in sk.describe_inputs():
+    print(entry)
+```
+
+Each entry reports the top-level names, plus `model_cache` (family, variant, file
+count, GiB) when a model manifest is present and `runtime_cache_gib` when the
+runtime archive is present. Only names and manifests are read, so running it on a
+28 GiB mount is fast.
+
+If no entry shows `model_cache`, the dataset does not contain a model cache in
+this format — the weights may have been uploaded as plain files instead. Attach a
+dataset produced by the notebook's upload cell, or let Strata download the model
+once and save it with `I_CONFIRM_MODEL_LICENSE_AND_PRIVATE_STORAGE = True`.
+
 ## Model family or variant is unsupported
 
 Run the notebook's Strata plan cell and choose a family/variant accepted by the installed Strata release. Not every Hugging Face model is compatible with Strata. Review the plan before approving large downloads.

@@ -326,11 +326,19 @@ def dataset_mount_report() -> dict[str, Any]:
 def log_mount_state() -> dict[str, Any]:
     """Print what is mounted, so "not attached" comes with evidence."""
     report = dataset_mount_report()
-    if report["attached"]:
-        log("Attached datasets: " + ", ".join(report["attached"]))
-    else:
+    if not report["attached"]:
         log("No dataset is attached to this session (searched " + ", ".join(report["roots"])
             + "). Add it under Add Input, then restart the session so it mounts.")
+        return report
+    log("Attached datasets: " + ", ".join(report["attached"]))
+    caches = [entry for entry in describe_inputs() if "model_cache" in entry]
+    if not caches:
+        log("No model-cache manifest in any attached dataset; Strata will download the model.")
+    for entry in caches:
+        cache = entry["model_cache"]
+        log("Model cache in " + entry["name"] + ": " + str(cache["family"]) + "/"
+            + str(cache["variant"]) + ", " + str(cache["files"]) + " files, "
+            + str(cache["gib"]) + " GiB.")
     return report
 
 
@@ -592,6 +600,92 @@ def _copy_verified(
     return expected, True
 
 
+MODEL_CACHE_FORMAT = "devzonex.strata-model-cache.v1"
+
+
+def _model_manifest_dirs(dataset: Path) -> list[Path]:
+    """Directories inside one attached dataset that may hold a model-cache manifest.
+
+    The uploader writes the manifest at the dataset root, but a dataset that also
+    carries other Strata files may keep it one level down, so both are checked.
+    """
+    dirs = [dataset]
+    try:
+        dirs += [path for path in sorted(dataset.iterdir())
+                 if path.is_dir() and not path.is_symlink()]
+    except OSError:
+        pass
+    return dirs
+
+
+def _model_manifest_in(dataset: Path) -> tuple[Path, dict[str, Any]] | None:
+    """Return (manifest folder, parsed manifest) when a dataset holds a model cache."""
+    for folder in _model_manifest_dirs(dataset):
+        manifest_path = folder / "manifest.json"
+        if not manifest_path.is_file():
+            continue
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if manifest.get("format") == MODEL_CACHE_FORMAT:
+            return folder, manifest
+    return None
+
+
+def find_model_cache(owner: str, slug: str) -> tuple[Path, Path, dict[str, Any]] | None:
+    """Find a model cache and return (dataset root, manifest folder, manifest).
+
+    The cache is normally its own dataset, ``strata-model-<family>-<variant>``.
+    A dataset that also holds the runtime cache still works when it carries a
+    valid manifest, so the expected name is preferred but not required. Only
+    manifests are read here; the weights are opened later, once entry sizes are
+    known.
+    """
+    preferred = find_attached_dataset(owner, slug, "manifest.json")
+    datasets: list[Path] = [preferred] if preferred else []
+    for path in attached_datasets():
+        if path not in datasets:
+            datasets.append(path)
+    for dataset in datasets:
+        found = _model_manifest_in(dataset)
+        if found is not None:
+            return dataset, found[0], found[1]
+    return None
+
+
+def describe_inputs(limit: int = 12) -> list[dict[str, Any]]:
+    """Summarize every attached dataset: its entries and any Strata manifests.
+
+    Only directory names and manifests are read, never model weights, so this is
+    cheap on a 28 GiB mount and safe to run before deciding what to restore.
+    """
+    report: list[dict[str, Any]] = []
+    for dataset in attached_datasets():
+        entry: dict[str, Any] = {"path": str(dataset), "name": dataset.name, "entries": []}
+        try:
+            entry["entries"] = sorted(path.name for path in dataset.iterdir())[:limit]
+        except OSError:
+            pass
+        found = _model_manifest_in(dataset)
+        if found is not None:
+            folder, manifest = found
+            saved = manifest.get("model") or {}
+            files = manifest.get("files") or []
+            entry["model_cache"] = {
+                "manifest_dir": str(folder), "family": saved.get("family"),
+                "variant": saved.get("variant"), "files": len(files),
+                "gib": round(sum(int(item.get("size") or 0) for item in files) / (1024 ** 3), 2),
+            }
+        for folder in _model_manifest_dirs(dataset):
+            archive = folder / "strata-runtime-cache.bin"
+            if archive.is_file():
+                entry["runtime_cache_gib"] = round(archive.stat().st_size / (1024 ** 3), 2)
+                break
+        report.append(entry)
+    return report
+
+
 def restore_model_cache(owner: str, slug: str, data_dir: Path, workers: int = 8,
                         family: str | None = None, variant: str | None = None,
                         restore_mode: str = "copy") -> bool:
@@ -603,18 +697,14 @@ def restore_model_cache(owner: str, slug: str, data_dir: Path, workers: int = 8,
     """
     if restore_mode not in {"copy", "symlink"}:
         raise ValueError("restore_mode must be 'copy' or 'symlink'.")
-    ds = find_attached_dataset(owner, slug, "manifest.json")
-    if not ds:
+    found = find_model_cache(owner, slug)
+    if found is None:
         log("Model cache not attached; Strata will download the selected model on first launch.")
         log_mount_state()
         return False
-    try:
-        manifest = json.loads((ds / "manifest.json").read_text(encoding="utf-8"))
-    except Exception as exc:
-        raise RuntimeError("Cannot read model-cache manifest.") from exc
-    if manifest.get("format") != "devzonex.strata-model-cache.v1":
-        log("Unrecognized model cache manifest; not restoring it.")
-        return False
+    ds, manifest_dir, manifest = found
+    if ds.name != slug or ds.parent.name != owner:
+        log("Model cache found in " + str(ds) + " instead of " + owner + "/" + slug + ".")
     saved = manifest.get("model", {})
     if family and saved.get("family") != family:
         raise RuntimeError("Attached model cache family does not match the selected family.")
@@ -624,7 +714,8 @@ def restore_model_cache(owner: str, slug: str, data_dir: Path, workers: int = 8,
     if not entries:
         raise RuntimeError("Model cache manifest is empty.")
     total = sum(int(e["size"]) for e in entries)
-    log("Restoring " + str(len(entries)) + " model files (" + f"{total / (1024**3):.2f} GiB" + ") using " + restore_mode + " mode.")
+    log("Restoring " + str(len(entries)) + " model files (" + f"{total / (1024**3):.2f} GiB" + ") from "
+        + str(ds) + " using " + restore_mode + " mode.")
     data_dir.mkdir(parents=True, exist_ok=True)
 
     validated: list[tuple[Path, Path, int]] = []
@@ -636,9 +727,13 @@ def restore_model_cache(owner: str, slug: str, data_dir: Path, workers: int = 8,
         if not dataset_name.parts or dataset_name.is_absolute() or ".." in dataset_name.parts:
             raise RuntimeError("Unsafe dataset file name in model manifest: "
                                + str(item.get("dataset_name")))
-        src = ds.joinpath(*dataset_name.parts)
-        dst = data_dir.joinpath(*rel.parts)
         size = int(item["size"])
+        src = manifest_dir.joinpath(*dataset_name.parts)
+        if (not src.is_file() or src.stat().st_size != size) and manifest_dir != ds:
+            fallback = ds.joinpath(*dataset_name.parts)
+            if fallback.is_file() and fallback.stat().st_size == size:
+                src = fallback
+        dst = data_dir.joinpath(*rel.parts)
         if not src.is_file() or src.stat().st_size != size:
             raise RuntimeError("Model cache file missing or size mismatch: " + item["dataset_name"])
         validated.append((src, dst, size))

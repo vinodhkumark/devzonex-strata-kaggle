@@ -152,6 +152,11 @@ Use `notebooks/Strata_Cache_Builder.ipynb`:
 3. If the cell reports that a helper is missing, switch to **T4 ×2**, rerun the
    load/restore cells (the accelerator change restarts the kernel and wipes
    `/root`), then create and upload the datasets in that same session.
+4. If free disk is below roughly 65 GiB, use the two-pass flow in section 3c:
+   build and upload the model with `CPU_FETCH_DRAFT = False`, wait for the
+   dataset to be **Ready**, delete `models/` and `packs/`, then run the cell
+   again with `CPU_DOWNLOAD_MODEL = False`, `CPU_BUILD_PACK = False` and
+   `CPU_FETCH_DRAFT = True`. The draft-only pass does not need the GGUF.
 
 Changing the accelerator never preserves `/root`, so upload before ending the
 session. Uploads with the accelerator attached consume GPU wall-clock.

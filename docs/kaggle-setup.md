@@ -11,7 +11,7 @@ download and preparation helpers directly, so no NVIDIA check is involved. Use
 - [ ] Open `notebooks/Strata_Cache_Builder.ipynb` in Kaggle using **New Notebook → Load from URL** or import the file.
 - [ ] Accelerator **None**, Internet on, `KAGGLE_API_TOKEN` secret enabled, `strata-runtime-cache` attached if it already exists.
 - [ ] Run sections 1–3b. The probe prints `strata --help`, `strata launch --help` and the launch plan, and records the real file list and sizes.
-- [ ] Set `CPU_PREPARE_MODEL = True` in section 3c and run it. Expect ~63.7 GB (58.5 GB model + 5.2 GB draft layer); the run is resumable.
+- [ ] Set `CPU_PREPARE_MODEL = True` in section 3c and run it. Expect ~63.7 GB of downloads (58.5 GB model + 5.2 GB MTP tensors); the uploaded draft layer is ~1 GiB and the run is resumable.
 - [ ] Confirm `models/`, `packs/` and `mtp/` have real bytes in `cache_status()`. If the cell reports a missing helper, switch the accelerator to **T4 ×2**, rerun the load/restore cells, and use section 4 as the fallback.
 - [ ] Run section 5 in the same session that produced the files. Confirm `strata-runtime-cache`, `strata-mtp-rt` and `strata-model-<family>-<variant>` all show **Ready** before ending the session.
 

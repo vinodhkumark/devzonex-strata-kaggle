@@ -697,10 +697,17 @@ warnings = []
 if config["download_model"]:
     # Fatal on purpose: without the GGUF nothing else can be prepared.
     setup.download(fam["hf"] + model_path.name, model_path)
-elif not model_path.is_file():
-    raise SystemExit("the model file is missing: " + str(model_path))
-else:
+elif config["build_pack"]:
+    if not model_path.is_file():
+        raise SystemExit("the model file is missing: " + str(model_path))
     print("model already present:", model_path)
+elif model_path.is_file():
+    print("model already present:", model_path)
+else:
+    # A draft-only pass after the model dataset was uploaded and the local
+    # GGUF deleted: the MTP tensors come from the original checkpoint, not
+    # from this model file.
+    print("model not needed for this step:", model_path)
 
 pack_ok = draft_ok = False
 if config["build_pack"] or config["fetch_draft"]:

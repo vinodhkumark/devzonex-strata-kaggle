@@ -36,7 +36,7 @@ Our working Kaggle setup used **2 × NVIDIA Tesla T4 GPUs (about 15 GB VRAM each
 
 We use **Strata + the Gyro-S quantization**, rather than trying to load a larger, less-compressed version entirely into GPU memory. Strata manages expert weights across available VRAM and system memory; Gyro-S also keeps its large n-gram/PLE table on disk and reads relevant data as needed. That is why a model with 125B total parameters can be practical on this setup even though it would not fit as a conventional full-weight GPU-only load. The trade-off is that SSD access and memory pressure can reduce speed, and the Gyro-S quantization has lower quality than larger variants.
 
-Our model cache is about **79.94 GiB** because it includes more than the headline GGUF file: model data, expert/dense pack files, tokenizer/support assets, and a path manifest. That is why it gets its own dataset; the ~5.2 GiB MTP draft layer has another, and the Strata runtime cache is about **1.3 GiB**.
+Our model cache is about **79.94 GiB** because it includes more than the headline GGUF file: model data, expert/dense pack files, tokenizer/support assets, and a path manifest. That is why it gets its own dataset; the MTP draft layer has another (5.2 GB downloaded and packed into a ~1 GiB `mtp/rt`), and the Strata runtime cache is about **1.3 GiB**.
 
 ### Why does Kaggle still show “Downloaded” after I attach the dataset?
 
@@ -195,7 +195,7 @@ MODEL_FILES_DATASET = ""
 # One dataset per artifact.
 UPLOAD_CACHES = True                 # master switch
 UPLOAD_RUNTIME_CACHE = True          # ~1.3 GiB
-UPLOAD_DRAFT_LAYER = True            # ~5.2 GiB, shared by variants
+UPLOAD_DRAFT_LAYER = True            # ~1 GiB final, shared by variants
 UPLOAD_MODEL_CACHE = True            # ~80 GiB
 I_CONFIRM_MODEL_LICENSE_AND_PRIVATE_STORAGE = False
 FORCE_UPDATE_MODEL_CACHE = False
@@ -234,7 +234,7 @@ connect a client; see [step 3c](#3c-optional-quality-gate).
 By default the notebook plans to use these separate datasets, one per artifact:
 
 - `<your-username>/strata-runtime-cache` — compiled terminal + engine (~1.3 GiB)
-- `<your-username>/strata-mtp-rt` — MTP draft layer, shared by every variant (~5.2 GiB)
+- `<your-username>/strata-mtp-rt` — MTP draft layer, shared by every variant (~1 GiB final; 5.2 GB downloaded)
 - `<your-username>/strata-model-<family>-<variant>` — `models/` + `packs/` (~80 GiB)
 
 These are user-owned caches, not global datasets shared by the project owner. Attach only datasets you own or have been granted access to. The public `clothespin/strata-qfn-assets-lite` draft-layer mirror is opt-in only: leave `DRAFT_LAYER_DATASET` blank to use your own dataset.
@@ -334,7 +334,7 @@ If an unauthenticated public request succeeds with HTTP `200`, stop the tunnel a
 | Cache dataset | What's saved | Purpose |
 |---|---|---|
 | Model cache (`strata-model-<family>-<variant>`) | `models/` + `packs/` plus path-and-size manifest | Avoid re-downloading model assets from their original source |
-| Draft layer (`strata-mtp-rt`) | `mtp/rt/` as flat `mtp_rt__*` files plus manifest | Fetch the ~5.2 GiB MTP layer once for every variant |
+| Draft layer (`strata-mtp-rt`) | `mtp/rt/` as flat `mtp_rt__*` files plus manifest | Fetch the 5.2 GB MTP tensors once; the uploaded layer is ~1 GiB |
 | Runtime cache (`strata-runtime-cache`) | Strata terminal, engine components, manifest/checksum, and optionally Cloudflare Tunnel binary | Avoid recompiling the engine (~10–15 min) and re-downloading the same compatible runtime build |
 
 The notebook creates datasets without a public-visibility flag. Verify each dataset's visibility and file list on Kaggle. “Upload successful” means the files transferred; it does not necessarily mean Kaggle finished processing the dataset.

@@ -1089,6 +1089,33 @@ class CpuPrepareTests(unittest.TestCase):
             self.assertIn("has no", str(caught.exception))
             self.assertIn("fetch_mtp", str(caught.exception))
 
+    def test_draft_only_pass_runs_without_the_model(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            fake_setup = root / "setup.py"
+            fake_setup.write_text(
+                "from pathlib import Path\n"
+                "FAMILIES = {'gyro': {'tag': 'gyro-', 'hf': 'http://example.invalid/', 'file': '{q}.gguf'}}\n"
+                "def model_file(fam, model, i): return 'x.gguf'\n"
+                "def get_llama_cpp(): return '.'\n"
+                "def fetch_mtp(mtp, env):\n"
+                "    (Path(mtp) / 'rt').mkdir(parents=True, exist_ok=True)\n"
+                "    (Path(mtp) / 'rt' / 'experts.bin').write_bytes(b'x' * 4)\n"
+                "def run(cmd, env=None): return None\n"
+                "def refresh_draft_vocab(rt, choice='cjk'): return None\n",
+                encoding="utf-8")
+            with patch.object(strata_kaggle, "WORKING", root / "working"), \
+                    patch.object(strata_kaggle, "find_strata_setup", return_value=fake_setup), \
+                    patch.object(strata_kaggle, "strata_terminal_python", return_value=sys.executable):
+                summary = prepare_model_on_cpu(
+                    root / "data", "gyro", "gyro-s",
+                    download_model=False, build_pack=False, fetch_draft=True)
+            self.assertEqual(summary["returncode"], 0)
+            self.assertEqual(summary["model_bytes"], 0)
+            self.assertFalse(summary["pack_ok"])
+            self.assertTrue(summary["draft_ok"])
+            self.assertEqual(summary["warnings"], [])
+
     def test_generated_script_keeps_the_model_when_the_pack_fails(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

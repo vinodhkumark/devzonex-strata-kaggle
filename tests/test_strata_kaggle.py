@@ -4,6 +4,7 @@ import hashlib
 import contextlib
 import io
 import json
+import subprocess
 import sys
 import tempfile
 import tarfile
@@ -22,7 +23,9 @@ from scripts.strata_kaggle import find_model_cache, describe_inputs
 from scripts.strata_kaggle import adopt_model_bundle, _model_source_args
 from scripts.strata_kaggle import (upload_model_cache, upload_draft_layer, cache_status,
                                    DRAFT_LAYER_PREFIX, DRAFT_LAYER_FORMAT,
-                                   setup_model_name)
+                                   setup_model_name, strata_terminal_python,
+                                   find_strata_setup, prepare_model_on_cpu)
+import scripts.strata_kaggle as strata_kaggle
 
 
 class StrataKaggleTests(unittest.TestCase):
@@ -987,6 +990,136 @@ class NotebookIntegrityTests(unittest.TestCase):
                     continue
                 with self.subTest(notebook=path.name, cell=number):
                     ast.parse("".join(cell["source"]))
+
+
+class CpuPrepareTests(unittest.TestCase):
+    def test_terminal_python_is_read_from_version_line(self):
+        with tempfile.TemporaryDirectory() as td:
+            interpreter = Path(td) / "python3.12"
+            interpreter.write_text("", encoding="utf-8")
+            fake = subprocess.CompletedProcess(
+                ["strata", "--version"], 0,
+                "strata 0.2.5 (build 123; python 3.12.7 at " + str(interpreter) + ")\n", "")
+            with patch.object(strata_kaggle.subprocess, "run", return_value=fake), \
+                    patch.object(strata_kaggle.shutil, "which", return_value="/usr/bin/strata"):
+                self.assertEqual(strata_terminal_python(), str(interpreter))
+
+    def test_terminal_python_falls_back_to_the_kernel(self):
+        fake = subprocess.CompletedProcess(["strata", "--version"], 0, "not the expected line\n", "")
+        with patch.object(strata_kaggle.subprocess, "run", return_value=fake), \
+                patch.object(strata_kaggle.shutil, "which", return_value="/usr/bin/strata"):
+            self.assertEqual(strata_terminal_python(), sys.executable)
+
+    def test_find_strata_setup_requires_the_tools_folder(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "terminal" / "current").mkdir(parents=True)
+            setup = root / "terminal" / "current" / "setup.py"
+            setup.write_text("# setup\n", encoding="utf-8")
+            with patch.object(strata_kaggle, "STRATA_ROOT", root), \
+                    patch.object(strata_kaggle.shutil, "which", return_value=None), \
+                    patch.object(strata_kaggle, "STRATA_BIN", root / "missing"):
+                with self.assertRaises(RuntimeError):
+                    find_strata_setup()
+                tools = setup.parent / "tools"
+                tools.mkdir()
+                (tools / "iq_pack.py").write_text("# tool\n", encoding="utf-8")
+                self.assertEqual(find_strata_setup(), setup)
+
+    def test_prepare_model_on_cpu_passes_the_setup_spelling(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            setup = root / "setup.py"
+            setup.write_text("# setup\n", encoding="utf-8")
+            seen = {}
+
+            def fake_run(command, **kwargs):
+                seen["command"] = command
+                return subprocess.CompletedProcess(
+                    command, 0, 'CPU_PREPARE_RESULT {"model": "/data/models/gyro-Gyro-S/x.gguf"}\n', None)
+
+            with patch.object(strata_kaggle, "WORKING", root / "working"), \
+                    patch.object(strata_kaggle, "find_strata_setup", return_value=setup), \
+                    patch.object(strata_kaggle, "strata_terminal_python", return_value=sys.executable), \
+                    patch.object(strata_kaggle, "run_streaming", side_effect=fake_run):
+                summary = prepare_model_on_cpu(root / "data", "gyro", "gyro-s")
+            config = json.loads(seen["command"][2])
+            self.assertEqual(config["model"], "Gyro-S")
+            self.assertEqual(config["family"], "gyro")
+            self.assertTrue(config["download_model"])
+            self.assertEqual(summary["model"], "/data/models/gyro-Gyro-S/x.gguf")
+            self.assertEqual(summary["returncode"], 0)
+            script = (root / "working" / "strata_cpu_prepare.py").read_text(encoding="utf-8")
+            self.assertIn("setup.download(", script)
+            self.assertIn("fetch_mtp", script)
+
+    def test_prepare_model_on_cpu_reports_a_failed_run(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            setup = root / "setup.py"
+            setup.write_text("# setup\n", encoding="utf-8")
+            failed = subprocess.CompletedProcess(["python"], 1, "the download stopped\n", None)
+            with patch.object(strata_kaggle, "WORKING", root / "working"), \
+                    patch.object(strata_kaggle, "find_strata_setup", return_value=setup), \
+                    patch.object(strata_kaggle, "strata_terminal_python", return_value=sys.executable), \
+                    patch.object(strata_kaggle, "run_streaming", return_value=failed):
+                with self.assertRaises(RuntimeError) as caught:
+                    prepare_model_on_cpu(root / "data", "gyro", "gyro-s")
+            self.assertIn("the download stopped", str(caught.exception))
+
+    def test_prepare_model_on_cpu_needs_a_variant(self):
+        with self.assertRaises(ValueError):
+            prepare_model_on_cpu(Path("/tmp"), "gyro", "")
+
+    def test_generated_script_reports_a_missing_helper(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            fake_setup = root / "setup.py"
+            fake_setup.write_text(
+                "FAMILIES = {'gyro': {'tag': 'gyro-', 'hf': 'http://example.invalid/', 'file': '{q}.gguf'}}\n"
+                "def model_file(fam, model, i): return 'x.gguf'\n"
+                "def get_llama_cpp(): return '.'\n"
+                "def download(url, dst): dst.parent.mkdir(parents=True, exist_ok=True); dst.write_bytes(b'x')\n",
+                encoding="utf-8")
+            with patch.object(strata_kaggle, "WORKING", root / "working"), \
+                    patch.object(strata_kaggle, "find_strata_setup", return_value=fake_setup), \
+                    patch.object(strata_kaggle, "strata_terminal_python", return_value=sys.executable):
+                with self.assertRaises(RuntimeError) as caught:
+                    prepare_model_on_cpu(root / "data", "gyro", "gyro-s")
+            self.assertIn("has no", str(caught.exception))
+            self.assertIn("fetch_mtp", str(caught.exception))
+
+    def test_generated_script_keeps_the_model_when_the_pack_fails(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "tools").mkdir()
+            (root / "tools" / "iq_pack.py").write_text("# tool\n", encoding="utf-8")
+            (root / "llama" / "gguf-py").mkdir(parents=True)
+            fake_setup = root / "setup.py"
+            fake_setup.write_text(
+                "from pathlib import Path\n"
+                "FAMILIES = {'gyro': {'title': 'Gyro', 'tag': 'gyro-', "
+                "'hf': 'http://example.invalid/', 'file': '{q}.gguf', "
+                "'pack_args': ['--compat-bf16'], 'shards': 1}}\n"
+                "MODELS = {'Gyro-S': {'file': 'Qwen-Gyro-S.gguf', 'shards': 1}}\n"
+                "def model_file(fam, model, i): return MODELS[model]['file']\n"
+                "def download(url, dst):\n"
+                "    dst.parent.mkdir(parents=True, exist_ok=True)\n"
+                "    dst.write_bytes(b'x' * 10)\n"
+                "def get_llama_cpp(): return Path(__file__).parent / 'llama'\n"
+                "def run(cmd, env=None): raise SystemExit(3)\n"
+                "def fetch_mtp(mtp, env): print('fetch_mtp')\n"
+                "def refresh_draft_vocab(rt, choice='cjk'): print('vocab')\n",
+                encoding="utf-8")
+            with patch.object(strata_kaggle, "WORKING", root / "working"), \
+                    patch.object(strata_kaggle, "find_strata_setup", return_value=fake_setup), \
+                    patch.object(strata_kaggle, "strata_terminal_python", return_value=sys.executable):
+                summary = prepare_model_on_cpu(root / "data", "gyro", "gyro-s")
+            self.assertEqual(summary["returncode"], 0)
+            self.assertEqual(summary["model_bytes"], 10)
+            self.assertFalse(summary["pack_ok"])
+            self.assertFalse(summary["draft_ok"])
+            self.assertTrue(any("pack build stopped" in item for item in summary["warnings"]))
 
 
 class SetupModelNameTests(unittest.TestCase):

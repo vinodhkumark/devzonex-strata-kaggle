@@ -244,11 +244,16 @@ Build the datasets once with [`notebooks/Strata_Cache_Builder.ipynb`](notebooks/
 | Phase | Accelerator | What happens |
 |---|---|---|
 | Load helpers, restore the runtime, probe `strata --help` and `--plan` | **None (CPU)** | no CUDA needed; the plan is cheap and lists the real files and sizes |
-| Fetch the model, the draft layer and prepare packs | **None (CPU), in most builds** | `strata install … --no-start` runs `setup.py` without starting; `strata launch … --yes` is documented to download even when no engine is usable. Then upload from the same CPU session |
+| Fetch the model, build packs, fetch the draft layer | **None (CPU)** | `prepare_model_on_cpu()` imports the installed `setup.py` and calls its download and preparation helpers directly (`setup.download`, `tools/iq_pack.py`, `tools/mtp_fetch.py` + `mtp_pack.py` + `mtp_rt.py`). `strata install` / `strata launch` cannot do this: their `main()` stops on a machine with no NVIDIA/AMD card before downloading anything |
 | Compile a compatible engine and serve | **GPU (T4 ×2)** | the engine is compiled for the GPU it runs on (`sm_75` for T4); the runtime dataset already provides a matching one |
 | Normal serving session | **GPU (T4 ×2)** | run the launcher |
 
-A CPU session cannot *serve* a model, and if neither CPU prepare mode downloads anything, the model must be fetched in a GPU session instead. Switching the accelerator restarts the kernel and wipes `/root`, so run the upload cell in the same session that produced the files. Uploads also consume GPU wall-clock when the accelerator is attached.
+A CPU session cannot *serve* a model, but it can create all three datasets. If a
+Strata build does not expose the helpers the CPU path calls, the cell says so and
+section 4's GPU session is the fallback. Switching the accelerator restarts the
+kernel and wipes `/root`, so run the upload cell in the same session that
+produced the files. Uploads also consume GPU wall-clock when the accelerator is
+attached.
 
 Use [`notebooks/Strata_Cache_Builder.ipynb`](notebooks/Strata_Cache_Builder.ipynb) for the CPU probe, the prepare attempt and the upload; use the launcher for serving.
 

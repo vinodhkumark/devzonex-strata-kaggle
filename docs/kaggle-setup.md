@@ -4,14 +4,16 @@ The quickest entry point is the **Open in Kaggle** badge at the top of the [repo
 
 ## First run: create the datasets
 
-Dataset creation needs one **GPU T4 ×2** session because those files exist only after `strata launch`. Use `notebooks/Strata_Cache_Builder.ipynb` for the CPU probe and the GPU handoff:
+Dataset creation runs on **CPU**: section 3c calls the installed `setup.py`'s
+download and preparation helpers directly, so no NVIDIA check is involved. Use
+`notebooks/Strata_Cache_Builder.ipynb`:
 
 - [ ] Open `notebooks/Strata_Cache_Builder.ipynb` in Kaggle using **New Notebook → Load from URL** or import the file.
-- [ ] First pass: accelerator **None**, Internet on, `KAGGLE_API_TOKEN` secret enabled, `strata-runtime-cache` attached if it already exists.
-- [ ] Run the probe cells. They print `strata --help`, `strata launch --help` and the launch plan, and record the real file list and sizes. A CPU-only fetch command, if one exists, is the only way to skip the GPU for the data phase.
-- [ ] If the probe finds no CPU-safe fetch, switch the accelerator to **T4 ×2**. The kernel restarts and `/root` is wiped, so rerun the load and restore cells.
-- [ ] Confirm the GPU cell reports two T4s and free disk on `MODEL_DATA_DIR`.
-- [ ] Run the upload cell in the same session that produced the files. Confirm `strata-runtime-cache`, `strata-mtp-rt` and `strata-model-<family>-<variant>` all show **Ready** before ending the session.
+- [ ] Accelerator **None**, Internet on, `KAGGLE_API_TOKEN` secret enabled, `strata-runtime-cache` attached if it already exists.
+- [ ] Run sections 1–3b. The probe prints `strata --help`, `strata launch --help` and the launch plan, and records the real file list and sizes.
+- [ ] Set `CPU_PREPARE_MODEL = True` in section 3c and run it. Expect ~63.7 GB (58.5 GB model + 5.2 GB draft layer); the run is resumable.
+- [ ] Confirm `models/`, `packs/` and `mtp/` have real bytes in `cache_status()`. If the cell reports a missing helper, switch the accelerator to **T4 ×2**, rerun the load/restore cells, and use section 4 as the fallback.
+- [ ] Run section 5 in the same session that produced the files. Confirm `strata-runtime-cache`, `strata-mtp-rt` and `strata-model-<family>-<variant>` all show **Ready** before ending the session.
 
 You can also run the launcher itself once on GPU: it launches Strata and its save cell now uploads the three datasets in order (runtime → draft layer → model).
 

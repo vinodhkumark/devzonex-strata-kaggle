@@ -178,7 +178,27 @@ UPLOAD_CACHES = True
 I_CONFIRM_MODEL_LICENSE_AND_PRIVATE_STORAGE = False
 FORCE_UPDATE_MODEL_CACHE = False
 FORCE_UPDATE_RUNTIME_CACHE = False
+
+# GPU-hour guards: the supervision cell stops Strata when nobody is using it.
+IDLE_MINUTES = 15                    # finish after this many idle minutes; 0 disables the check
+SERVE_MINUTES = 0                    # hard stop for the supervision cell; 0 = only the idle check
+
+# Quality gate: benchmark the chat API and check tool calling.
+RUN_QUALITY_GATE = False             # several extra minutes; run it once per model
+QUALITY_REPEATS = 1
+
+# Optional PEM RSA public key from a local launcher. When set, the API key is
+# published encrypted and never appears in notebook output.
+CLIENT_PUBLIC_KEY = ""
 ```
+
+`IDLE_MINUTES` and `SERVE_MINUTES` protect your GPU quota. The supervision cell
+stops Strata after the configured idle time, and returning from that cell lets
+Kaggle finish the run and release the GPU instead of idling to the session limit.
+Set `SERVE_MINUTES = 0` (the default) when you want only the idle check.
+
+`RUN_QUALITY_GATE = True` runs a benchmark and a tool-calling check before you
+connect a client; see [step 3c](#3c-optional-quality-gate).
 
 **Replace the placeholder Kaggle username.** Dataset names are derived from your configured username and model family/variant.
 
@@ -195,7 +215,7 @@ Keep `I_CONFIRM_MODEL_LICENSE_AND_PRIVATE_STORAGE = False` until you have checke
 
 ## 4. Run the notebook cells in order
 
-1. **Load helpers and credentials** — clones the repository's scripts and reads your Kaggle Secret.
+1. **Load helpers and credentials** — clones the repository's scripts and reads your Kaggle Secret. It also validates the configuration and reports GPU, RAM and free disk before a long launch.
 2. **Restore caches or install Strata** — uses attached private datasets when available; installs Strata if not.
 3. **Review plan** — inspect Strata's plan and confirm the selected model, engine, context, and GPU setup before downloading.
 4. **Launch Strata** — fetches missing compatible model/engine files on a first run.
@@ -203,6 +223,28 @@ Keep `I_CONFIRM_MODEL_LICENSE_AND_PRIVATE_STORAGE = False` until you have checke
 6. **Authenticated generation test** — confirms chat completions work.
 7. **Upload private caches** — stores the model and runtime separately, if enabled and permitted.
 8. **Print OpenCode config** — provides the current URL/model/provider snippet.
+9. **Supervise and release** — watches request activity and stops Strata when idle.
+
+### 3b. Optional: measure the drafter
+
+`RUN_DRAFTING_AB = True` reloads the model twice, once with `DRAFTING = "off"` and
+once with `"auto"`, and reports the measured difference. It is slow and opt-in.
+
+### 3c. Optional: quality gate
+
+`RUN_QUALITY_GATE = True` does two things before you connect a client:
+
+- **Benchmark** — prompt and decode tokens/s plus time-to-first-token at 128, 512
+  and 2048-word prompts, using the server's own timings when it reports them.
+- **Tool calling** — gives the model `read_file`, `write_file` and `run_test`
+  tools, asks it to fix a local file so a function returns 42, and checks that
+  the edit actually happened and the test really ran.
+
+The tool check is the one that predicts whether an agent session will work: a
+model can decode quickly and still emit invalid tool calls, edit before reading,
+or claim success without running the test. It is also how to compare two model
+variants on something more useful than tokens/s. Expect several extra minutes.
+
 
 Before the endpoint is considered ready, the checks should establish:
 
@@ -226,17 +268,30 @@ Large uploads may be rejected due to account limits, disk space, network issues,
 
 ---
 
-# ⏱️ Keep Strata running for six hours
+# ⏱️ Supervise the session and release GPU hours
 
-After the launch, tunnel, and authenticated API test succeed, the notebook contains an **optional six-hour supervision cell**. Run it when you want to keep the notebook actively monitoring the actual service. It checks:
+After the launch, tunnel, and authenticated API test succeed, run the
+**supervision cell** and leave it as the last cell that runs. It:
 
-- the local Strata health response,
-- that the model remains loaded and API-key protected,
-- periodically, that the public URL still rejects no-key requests.
+- checks once that the public URL still rejects a no-key request,
+- watches the server's `/v1/status` request activity,
+- stops Strata after `IDLE_MINUTES` without a request, or after `SERVE_MINUTES`
+  if you set one,
+- prints a `STRATA_SHUTDOWN={...}` record with the reason and elapsed time.
 
-This is a genuine health monitor, not a fake mouse/keyboard keepalive. It does **not** override Kaggle's session or GPU quota limits and cannot guarantee uptime. Kaggle's published docs list up to 12 hours for CPU/GPU notebook executions and a shorter time for TPU sessions; limits can change. Stop the monitor when you finish.
+Returning from that cell lets the notebook finish, and a finished notebook
+releases the GPU allocation. That is the difference between losing 15 minutes of
+quota to an abandoned session and losing hours to it.
 
-For long executions, Kaggle's **Save Version → Save & Run All** workflow can run in the background until the platform's runtime cap. However, the full notebook must finish or reach its monitoring cell within the permitted session, and you must be able to retrieve the emitted tunnel URL. Do not treat a free notebook as an always-on production server.
+The cell does **not** override Kaggle's session or GPU quota limits and cannot
+guarantee uptime. Kaggle's published docs list up to 12 hours for CPU/GPU
+notebook executions and a shorter time for TPU sessions; limits can change.
+
+For long executions, Kaggle's **Save Version → Save & Run All** workflow can run
+in the background until the platform's runtime cap. However, the full notebook
+must finish or reach its supervision cell within the permitted session, and you
+must be able to retrieve the emitted tunnel URL. Do not treat a free notebook as
+an always-on production server.
 
 ---
 

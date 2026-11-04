@@ -61,9 +61,43 @@ A Quick Tunnel exists only while its process/session is active. Use the latest H
 - Test the authenticated `/v1/models` and `/v1/chat/completions` endpoints independently before troubleshooting OpenCode.
 - Confirm the configured context/output limits match the running Strata model. After changing compaction/provider settings, start a fresh OpenCode session.
 
-## Six-hour monitor doesn't complete
+## Supervision cell exits or never stops
 
-The monitor checks local model health and the tunnel's no-key authentication boundary. It does not override Kaggle session limits, quotas, network outages, or runtime shutdown. A notebook may end before six hours if the platform or account limit is reached.
+The supervision cell stops Strata for one of two reasons, printed as
+`STRATA_SHUTDOWN={"reason": ...}`:
+
+- `idle_timeout` — no API request arrived for `IDLE_MINUTES`. Raise the value, or
+  send a request from your client to reset the timer.
+- `serve_deadline` — `SERVE_MINUTES` elapsed.
+
+If it raises instead, the server did not report `/v1/status` activity and
+`SERVE_MINUTES` was `0`, so there was no way to detect idleness. Set
+`SERVE_MINUTES` to a bounded window. The cell does not override Kaggle session
+limits, quotas, network outages, or runtime shutdown.
+
+## Quality gate fails or is very slow
+
+The tool check asks the model to read, edit and test a local file, and it fails
+loudly rather than reporting a false pass. Common causes:
+
+- **Invalid tool call, or an edit before reading** — the model skipped
+  `read_file`. That usually means the prompt or template is too small a model for
+  agent use; try a larger variant.
+- **Gave up within N turns** — the model kept answering in prose instead of
+  calling tools. The same signal applies.
+- **It takes minutes** — expected. A dual T4 prefills slowly, so a 12-turn task
+  can take a while. Run it once per model variant, not on every session.
+
+A `FAIL` here predicts an agent client that loops or stalls even though the
+speed numbers look fine.
+
+## OpenCode waits forever on the first token
+
+The notebook's generated provider entry sets `headerTimeout` and `chunkTimeout`
+to 15 minutes because a T4 can spend minutes loading or paging experts. If you
+wrote your own config, raise those values; the defaults are far too short. Also
+confirm `compatibility.reasoningField` is `reasoning_content`, otherwise thinking
+tokens appear as answer text.
 
 ## Model restore progress is quiet
 

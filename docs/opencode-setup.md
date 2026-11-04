@@ -10,4 +10,19 @@
 
 Keep the key out of GitHub and chat. The Quick Tunnel URL is temporary and changes after tunnel restart.
 
-8. The generated model configuration includes `reasoningEffort: "none"` for the configured model entry.
+8. The generated model entry sets `compatibility.reasoningField` to
+   `reasoning_content`, so Strata's separate reasoning channel is treated as
+   thinking instead of answer text. It also sets `headerTimeout` and
+   `chunkTimeout` to 15 minutes: a T4 can spend minutes on the first token and
+   can pause mid-answer while the engine pages experts.
+
+The generated `limit.context` comes from the notebook's `CONTEXT` setting. If you
+change `CONTEXT`, regenerate the entry and start a fresh OpenCode session.
+
+### Optional: publish the key encrypted
+
+Set `CLIENT_PUBLIC_KEY` in the configuration cell to a PEM RSA public key and the
+notebook prints `STRATA_CONNECTION={"base_url": ..., "encrypted_api_key": ...}`.
+Only the holder of the private key can decrypt it, so the API key never appears
+in the notebook output and does not need to be stored as a Kaggle Secret. Leave
+it blank to keep the manual `strata launch --show-key` flow above.

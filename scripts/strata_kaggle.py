@@ -687,6 +687,29 @@ if family not in setup.FAMILIES:
 fam = setup.FAMILIES[family]
 tag = fam["tag"] + model
 model_path = data / "models" / tag / setup.model_file(fam, model, 1)
+if config.get("model_path"):
+    # An attached raw bundle: adopt_model_bundle() stages it under
+    # models/<family>-<variant>, which may differ in case from setup.py's tag
+    # (models/gyro-gyro-m instead of models/gyro-Gyro-M). Accept a folder or
+    # the file itself so a 92 GB model never has to be downloaded or copied.
+    given = Path(config["model_path"]).expanduser()
+    if given.is_dir():
+        found = sorted(p for p in given.glob("*.gguf") if p.is_file())
+        if len(found) != 1:
+            raise SystemExit("expected exactly one .gguf in " + str(given)
+                             + ", found " + str(len(found)))
+        model_path = found[0]
+    elif given.is_file():
+        model_path = given
+    else:
+        raise SystemExit("the model path does not exist: " + str(given))
+    print("using adopted model files at", model_path.parent)
+elif not config["download_model"] and not model_path.is_file():
+    candidates = [p for p in (data / "models").glob("*/" + model_path.name)
+                  if p.is_file() and p.parent.name.lower() == tag.lower()]
+    if len(candidates) == 1:
+        model_path = candidates[0]
+        print("model found at", model_path)
 pack_path = data / "packs" / tag.lower()
 mtp_path = data / "mtp"
 draft_path = mtp_path / "rt"
@@ -783,6 +806,7 @@ def prepare_model_on_cpu(
     download_model: bool = True,
     build_pack: bool = True,
     fetch_draft: bool = True,
+    model_path: Path | None = None,
     timeout: int = 12 * 60 * 60,
 ) -> dict[str, Any]:
     """Download and prepare a model on a CPU-only session, without serving it.
@@ -794,9 +818,16 @@ def prepare_model_on_cpu(
 
     The work is resumable: a finished file is skipped, and a partial download
     continues where it stopped. Returns a summary with the paths and file counts.
+
+    ``model_path`` points at an attached raw bundle (a folder, or one ``.gguf``).
+    It is used instead of downloading and lets a model larger than Kaggle's whole
+    writable layer stay on the read-only input mount while only the pack is built
+    locally.
     """
     if not variant:
         raise ValueError("A model variant is required, for example 'gyro-s'.")
+    if download_model and model_path:
+        raise ValueError("model_path is for an attached bundle; set download_model=False.")
     data_dir = Path(data_dir)
     data_dir.mkdir(parents=True, exist_ok=True)
     setup_py = find_strata_setup()
@@ -813,6 +844,7 @@ def prepare_model_on_cpu(
         "download_model": bool(download_model),
         "build_pack": bool(build_pack),
         "fetch_draft": bool(fetch_draft),
+        "model_path": str(model_path) if model_path else "",
     }
     log("CPU preparation uses " + str(setup_py))
     log("Interpreter: " + python)
@@ -1167,6 +1199,14 @@ def adopt_model_bundle(owner: str, slug: str, data_dir: Path, family: str, varia
                            + "; this does not look like a Strata model directory.")
     target = Path(data_dir) / "models" / (family + "-" + variant)
     target.mkdir(parents=True, exist_ok=True)
+    if restore_mode == "copy":
+        need = sum(path.stat().st_size for path in files)
+        free = shutil.disk_usage(target).free
+        if need > free:
+            raise RuntimeError(
+                "The attached bundle is " + f"{need / 1e9:.1f} GB" + " but only "
+                + f"{free / 1e9:.1f} GB" + " is free under " + str(target)
+                + ". Use MODEL_RESTORE_MODE = 'symlink' instead of copying it.")
     for source in files:
         destination = target / source.name
         if restore_mode == "symlink":

@@ -168,6 +168,26 @@ it, and repeat for the next model.
 Changing the accelerator never preserves `/root`, so upload before ending the
 session. Uploads with the accelerator attached consume GPU wall-clock.
 
+## A model larger than the writable layer (Gyro-M)
+
+`Qwen3.8-Flash-Next-Gyro-M-TQ2_0.gguf` is 91.97 GB. That is larger than Kaggle's
+whole ~70 GB writable layer, so it cannot be downloaded or copied into `/root`,
+`/tmp` or `/kaggle/temp`. Attach a dataset that already holds the GGUF and its
+`.done` mark, then set:
+
+```python
+MODEL_VARIANT = "gyro-m"
+MODEL_FILES_DATASET = "owner/slug"
+CPU_DOWNLOAD_MODEL = False
+CPU_BUILD_PACK = True
+MODEL_RESTORE_MODE = "symlink"
+```
+
+`adopt_model_bundle()` links the model from `/kaggle/input`, and section 3c
+builds only `packs/` locally. Keep `UPLOAD_ADOPTED_MODEL_FILES = False` so the
+model dataset you upload contains the pack, not a second 92 GB copy. The `.done`
+file is Strata's finish mark; `setup.download()` checks only that it exists.
+
 ## The draft layer is restored from the wrong dataset
 
 The MTP layer lives in its own dataset, `<your-username>/strata-mtp-rt`, and is

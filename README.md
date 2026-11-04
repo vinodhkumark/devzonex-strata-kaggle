@@ -234,6 +234,14 @@ delete `models/` and `packs/`, then build and upload the draft layer. Do the
 same rotation to try another model, because two ~58 GB models cannot coexist in
 one session. Each model has its own dataset; attach only the one you are serving.
 
+**Gyro-M does not fit at all.** Its GGUF is 91.97 GB, larger than the whole
+writable layer. If a dataset already holds `Qwen3.8-Flash-Next-Gyro-M-TQ2_0.gguf`
+(and its `.done` mark), attach it and set `MODEL_FILES_DATASET`, then run section
+3c with `CPU_DOWNLOAD_MODEL = False` and `CPU_BUILD_PACK = True`. The helper
+symlinks the GGUF from `/kaggle/input` and writes only `packs/` locally;
+`UPLOAD_ADOPTED_MODEL_FILES` stays `False`, so the upload contains only the pack.
+Set `MODEL_VARIANT = "gyro-m"` in both notebooks.
+
 `RUN_QUALITY_GATE = True` runs a benchmark and a tool-calling check before you
 connect a client; see [step 3c](#3c-optional-quality-gate).
 

@@ -220,6 +220,12 @@ stops Strata after the configured idle time, and returning from that cell lets
 Kaggle finish the run and release the GPU instead of idling to the session limit.
 Set `SERVE_MINUTES = 0` (the default) when you want only the idle check.
 
+`MODEL_DATA_DIR` is session scratch. It sits outside `/kaggle/working`, so the
+20 GB output quota does not apply to the model. Kaggle's `/tmp`, `/root` and
+`/kaggle/temp` are not separate larger disks, so download once to the path you
+will upload from; copying between them needs twice the space. The CPU download
+is ~63.7 GB decimal, about 59.3 GiB, which is what `df` reports.
+
 `RUN_QUALITY_GATE = True` runs a benchmark and a tool-calling check before you
 connect a client; see [step 3c](#3c-optional-quality-gate).
 

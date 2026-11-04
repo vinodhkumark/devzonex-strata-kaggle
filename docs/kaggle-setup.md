@@ -2,25 +2,28 @@
 
 The quickest entry point is the **Open in Kaggle** badge at the top of the [repository README](../README.md). It imports the public notebook into Kaggle; it cannot grant access to private datasets or secrets.
 
-## First run: download and cache
+## First run: create the datasets
 
-- [ ] Open `notebooks/Strata_Kaggle_Launcher.ipynb` in Kaggle using the badge or **New Notebook → Load from URL**.
-- [ ] Enable Internet and select an available NVIDIA GPU accelerator. Restart the runtime if Kaggle asks you to.
-- [ ] Add a secret named `KAGGLE_API_TOKEN` under **Add-ons → Secrets** and enable notebook access.
-- [ ] In the configuration cell, replace `your-kaggle-username` and choose a Strata-supported `MODEL_FAMILY` and `MODEL_VARIANT`.
-- [ ] Start with the default `gyro / gyro-s` example if you want to reproduce the setup documented in this repo.
-- [ ] Review the model license. Keep `I_CONFIRM_MODEL_LICENSE_AND_PRIVATE_STORAGE = False` until private caching is allowed for your selected model.
-- [ ] Run the notebook cells from top to bottom; review the Strata plan before the large download.
-- [ ] Confirm local health says the model is loaded, and verify unauthenticated requests are rejected (401/403) before using a public tunnel.
-- [ ] After the authenticated chat test succeeds, run the cache-upload cell. The helper uploads model data only when the explicit license confirmation is true and uploads the runtime to a separate private dataset.
-- [ ] Wait for Kaggle to finish processing both dataset uploads before ending the session.
+Dataset creation needs one **GPU T4 ×2** session because those files exist only after `strata launch`. Use `notebooks/Strata_Cache_Builder.ipynb` for the CPU probe and the GPU handoff:
+
+- [ ] Open `notebooks/Strata_Cache_Builder.ipynb` in Kaggle using **New Notebook → Load from URL** or import the file.
+- [ ] First pass: accelerator **None**, Internet on, `KAGGLE_API_TOKEN` secret enabled, `strata-runtime-cache` attached if it already exists.
+- [ ] Run the probe cells. They print `strata --help`, `strata launch --help` and the launch plan, and record the real file list and sizes. A CPU-only fetch command, if one exists, is the only way to skip the GPU for the data phase.
+- [ ] If the probe finds no CPU-safe fetch, switch the accelerator to **T4 ×2**. The kernel restarts and `/root` is wiped, so rerun the load and restore cells.
+- [ ] Confirm the GPU cell reports two T4s and free disk on `MODEL_DATA_DIR`.
+- [ ] Run the upload cell in the same session that produced the files. Confirm `strata-runtime-cache`, `strata-mtp-rt` and `strata-model-<family>-<variant>` all show **Ready** before ending the session.
+
+You can also run the launcher itself once on GPU: it launches Strata and its save cell now uploads the three datasets in order (runtime → draft layer → model).
+
+The uploader sends model data only when the explicit license confirmation is true. The model, the draft layer and the runtime are three separate private datasets.
 
 ## Returning run: restore caches
 
-- [ ] Start a fresh session using the same notebook.
+- [ ] Start a fresh session using `notebooks/Strata_Kaggle_Launcher.ipynb`.
 - [ ] Enable Internet/GPU and grant the notebook access to `KAGGLE_API_TOKEN`.
-- [ ] Use **Add Input** to attach your own model cache and runtime cache datasets. The cache names are printed by the notebook configuration cell.
+- [ ] Use **Add Input** to attach `strata-runtime-cache`, `strata-mtp-rt` and `strata-model-<family>-<variant>`. The cache names are printed by the notebook configuration cell.
 - [ ] Keep the Kaggle username, model family and variant consistent with the attached cache names.
+- [ ] Leave `MODEL_RESTORE_MODE = "symlink"` and `DRAFT_LAYER_DATASET = ""` (meaning your own `strata-mtp-rt`).
 - [ ] Run the notebook from top to bottom.
 - [ ] Confirm `Runtime cache restored: True` and `Model cache restored: True` before launching Strata.
 - [ ] Confirm the runtime checksum, health check and authenticated public API test all pass.
@@ -29,7 +32,9 @@ The quickest entry point is the **Open in Kaggle** badge at the top of the [repo
 
 Attaching a dataset makes files available to a new Kaggle runtime. Kaggle may show a notification such as `Downloaded 14/16 files: ... GiB / ... GiB`; that's the input data being staged from your Kaggle Dataset storage into the session, not a download from the original model host.
 
-The notebook defaults to `MODEL_RESTORE_MODE = "copy"` for this tutorial. It copies model files to `/root/strata-local`, which uses extra restore time and disk space but may improve local reads. Set `MODEL_RESTORE_MODE = "symlink"` to avoid the second local copy; reads from Kaggle's input mount may be slower. Kaggle still stages the attached dataset into a new session in either mode.
+The notebook defaults to `MODEL_RESTORE_MODE = "symlink"`: model, `packs/` and `mtp/` files are linked from `/kaggle/input`, so local disk holds only the extracted runtime (~1.5 GiB). Reads from the input mount may be slower; measure decode tokens/s with the quality gate. Set `"copy"` only when the free disk and restore time allow it — an ~80 GiB model usually does not fit.
+
+Kaggle still stages the attached dataset into a new session in either mode.
 
 No restore mode eliminates Kaggle's input staging or guarantees instant startup. The cache prevents the original-source model download when the attached files match the requested model; it does not turn the dataset into a permanently attached disk across all sessions.
 

@@ -703,7 +703,7 @@ def describe_inputs(limit: int = 12) -> list[dict[str, Any]]:
 
 def restore_model_cache(owner: str, slug: str, data_dir: Path, workers: int = 8,
                         family: str | None = None, variant: str | None = None,
-                        restore_mode: str = "copy") -> bool:
+                        restore_mode: str = "symlink") -> bool:
     """Restore a private cache by copying files locally or symlinking to the Kaggle input mount.
 
     'copy' duplicates bytes into local storage and reports live byte-level progress.
@@ -756,6 +756,8 @@ def restore_model_cache(owner: str, slug: str, data_dir: Path, workers: int = 8,
     if restore_mode == "symlink":
         created = 0
         already_linked = 0
+        kept_local = 0
+        kept_bytes = 0
         for src, dst, size in validated:
             dst.parent.mkdir(parents=True, exist_ok=True)
             if dst.is_symlink():
@@ -770,11 +772,17 @@ def restore_model_cache(owner: str, slug: str, data_dir: Path, workers: int = 8,
             elif dst.exists():
                 if dst.is_file() and dst.stat().st_size == size:
                     # Keep a valid existing local copy rather than replacing it with a link.
+                    kept_local += 1
+                    kept_bytes += size
                     continue
                 raise RuntimeError("Restore target already exists with unexpected content: " + str(dst))
             dst.symlink_to(src.resolve())
             created += 1
         log(f"Model cache linked without copying model bytes: {created} links created, {already_linked} already linked.")
+        if kept_local:
+            log(f"Warning: {kept_local} file(s) already existed as local copies and were kept "
+                f"({kept_bytes / (1024**3):.2f} GiB on local disk). Delete them before restoring "
+                "if you want symlink-only storage.")
         log("Note: Kaggle still stages the attached input dataset; symlink mode avoids only the extra copy to local storage.")
         return True
 
@@ -1091,7 +1099,7 @@ RESTORE_MODES = ("copy", "symlink")
 
 
 def validate_config(family: str, variant: str, context: str, drafting: str = "auto",
-                    vision: str = "off", restore_mode: str = "copy",
+                    vision: str = "off", restore_mode: str = "symlink",
                     gpu_list: str = "") -> dict[str, Any]:
     """Check the notebook configuration before a long launch spends GPU time.
 
@@ -1113,7 +1121,7 @@ def validate_config(family: str, variant: str, context: str, drafting: str = "au
     vision = (vision or "off").strip().lower()
     if vision not in VISION_MODES:
         raise ValueError("VISION must be 'on' or 'off'.")
-    restore_mode = (restore_mode or "copy").strip().lower()
+    restore_mode = (restore_mode or "symlink").strip().lower()
     if restore_mode not in RESTORE_MODES:
         raise ValueError("MODEL_RESTORE_MODE must be 'copy' or 'symlink'.")
     gpu_list = (gpu_list or "").strip()
@@ -1124,10 +1132,18 @@ def validate_config(family: str, variant: str, context: str, drafting: str = "au
             "vision": vision, "restore_mode": restore_mode, "gpu_ids": gpu_list}
 
 
-def environment_report(require_cuda: bool = True) -> dict[str, Any]:
-    """Collect hardware facts and fail early when the session cannot run the model."""
+def environment_report(require_cuda: bool = True, path: str | Path | None = None) -> dict[str, Any]:
+    """Collect hardware facts and fail early when the session cannot run the model.
+
+    ``path`` picks the filesystem whose free space is reported. On Kaggle the
+    model lives under ``MODEL_DATA_DIR`` (usually ``/root/...``) while
+    ``/kaggle/working`` is a different, much smaller filesystem, so reporting
+    the working directory alone hides how much room a download really has.
+    ``require_cuda=False`` allows a CPU-only session, for fetching or
+    publishing datasets without an accelerator.
+    """
     report: dict[str, Any] = {"gpus": [], "ram_gb": None, "disk_free_gb": None,
-                              "cpu_count": os.cpu_count()}
+                              "disk_path": None, "cpu_count": os.cpu_count()}
     if shutil.which("nvidia-smi"):
         result = subprocess.run(
             ["nvidia-smi", "--query-gpu=index,name,memory.total,compute_cap,driver_version",
@@ -1157,14 +1173,74 @@ def environment_report(require_cuda: bool = True) -> dict[str, Any]:
     except (OSError, StopIteration, ValueError, IndexError):
         pass
     try:
-        anchor = WORKING if WORKING.is_dir() else Path("/")
+        if path is not None:
+            anchor = Path(path).expanduser()
+            while not anchor.exists() and anchor != anchor.parent:
+                anchor = anchor.parent
+            report["disk_path"] = str(anchor)
+        else:
+            anchor = WORKING if WORKING.is_dir() else Path("/")
+            report["disk_path"] = str(anchor)
         report["disk_free_gb"] = round(shutil.disk_usage(anchor).free / (1024 ** 3), 1)
     except OSError:
         pass
     log("GPUs: " + (", ".join(g["name"] + " (" + str(g["memory_mib"]) + " MiB)" for g in report["gpus"])
                     or "none") + "; RAM: " + str(report["ram_gb"]) + " GiB; free disk: "
-        + str(report["disk_free_gb"]) + " GiB")
+        + str(report["disk_free_gb"]) + " GiB on " + str(report["disk_path"] or "?"))
     return report
+
+
+def _tree_size(path: Path) -> dict[str, Any]:
+    """Files and bytes under a path, counting symlinks by their target size."""
+    files = 0
+    total = 0
+    links = 0
+    for entry in Path(path).rglob("*"):
+        try:
+            if not entry.is_file():
+                continue
+            total += entry.stat().st_size
+            files += 1
+            if entry.is_symlink():
+                links += 1
+        except OSError:
+            continue
+    return {"path": str(path), "exists": Path(path).exists(), "files": files,
+            "links": links, "bytes": total, "gib": round(total / (1024 ** 3), 2)}
+
+
+def cache_status(data_dir: str | Path) -> dict[str, Any]:
+    """Summarize what a session will read from local disk versus the input mount.
+
+    Local disk is meant to hold the compiled runtime only; model, packs and the
+    draft layer normally point into attached datasets. This reports each root
+    separately and flags how much of it is real local storage, so a leftover
+    copy from an earlier ``copy`` restore is visible instead of silently
+    filling the disk.
+    """
+    root = Path(data_dir)
+    parts = {name: _tree_size(root / name) for name in ("models", "packs", "mtp")}
+    symlinked = {name: part["links"] for name, part in parts.items()}
+    status = {"data_dir": str(root), "parts": parts,
+              "runtime_dir": str(STRATA_ROOT),
+              "total_gib": round(sum(part["bytes"] for part in parts.values()) / (1024 ** 3), 2),
+              "model_gib": parts["models"]["gib"],
+              "packs_gib": parts["packs"]["gib"],
+              "mtp_gib": parts["mtp"]["gib"],
+              "symlinks": symlinked}
+    try:
+        status["disk_free_gb"] = round(shutil.disk_usage(root).free / (1024 ** 3), 1)
+    except OSError:
+        try:
+            status["disk_free_gb"] = round(shutil.disk_usage(WORKING).free / (1024 ** 3), 1)
+        except OSError:
+            status["disk_free_gb"] = None
+    for name, part in parts.items():
+        if part["exists"]:
+            log(f"{name}: {part['files']} files, {part['gib']:.2f} GiB, {part['links']} symlinked")
+    log("Cache roots total " + str(status["total_gib"]) + " GiB; free disk "
+        + str(status["disk_free_gb"]) + " GiB")
+    return status
 
 
 def _preset_args(preset: str | None = None, save_preset: str | None = None) -> list[str]:
@@ -1238,7 +1314,7 @@ def _draft_layer_entries(dataset_root: Path) -> dict[str, Path]:
 
 
 def restore_draft_layer(owner: str, slug: str, data_dir: Path,
-                        restore_mode: str = "copy", force: bool = False,
+                        restore_mode: str = "symlink", force: bool = False,
                         min_experts_bytes: int = MIN_DRAFT_LAYER_BYTES) -> bool:
     """Install the MTP draft layer (mtp/rt) from an attached public dataset.
 
@@ -1958,31 +2034,30 @@ def _clean_stage(stage: Path) -> None:
     stage.mkdir(parents=True, exist_ok=True)
 
 
+MODEL_CACHE_ROOTS = ("models", "packs")
+DRAFT_LAYER_FORMAT = "devzonex.strata-draft-layer.v1"
+DRAFT_DATASET_SLUG = "strata-mtp-rt"
+
+
 def upload_model_cache(data_dir: Path, username: str, slug: str, family: str, variant: str,
                        env: dict[str, str], license_confirmed: bool, force: bool = False,
-                       require_mtp: bool = False) -> bool:
+                       include: tuple[str, ...] = MODEL_CACHE_ROOTS) -> bool:
+    """Upload model weights and engine packs as their own private dataset.
+
+    The MTP draft layer is deliberately not included: the same layer serves every
+    Qwen3.8-Flash-Next variant, so upload_draft_layer() stores it once instead of
+    duplicating ~5.2 GiB inside each model dataset.
+    """
     if not license_confirmed:
         log("Skipped model upload. Confirm the model terms and enable the explicit license flag first.")
         return False
-    layer = mtp_layer_path(data_dir)
-    if require_mtp and not layer:
-        raise RuntimeError(
-            "Drafting is enabled but the MTP draft layer is not under " + str(Path(data_dir) / "mtp" / "rt")
-            + ". Launch once with drafting='auto' (about " + str(MTP_FETCH_GB) + " GB) before uploading, "
-            "or set DRAFTING='off' to cache the model without it."
-        )
     attached = find_attached_dataset(username, slug, "manifest.json")
     if attached and not force:
         try:
             old = json.loads((attached / "manifest.json").read_text(encoding="utf-8"))
             old_entries = old.get("files", [])
-            cache_has_mtp = any(
-                str(PurePosixPath(item.get("relative_path", ""))).startswith("mtp/")
-                for item in old_entries
-            )
             if (old.get("format") == "devzonex.strata-model-cache.v1"
-                    and old.get("model") == {"family": family, "variant": variant}
-                    and (cache_has_mtp or not require_mtp)):
+                    and old.get("model") == {"family": family, "variant": variant}):
                 cache_matches = bool(old_entries)
                 for item in old_entries:
                     rel = PurePosixPath(item["relative_path"])
@@ -1999,18 +2074,14 @@ def upload_model_cache(data_dir: Path, username: str, slug: str, family: str, va
         except Exception:
             pass
 
-    allowed_roots = {"models", "packs", "mtp"}
+    allowed_roots = set(include)
     files = sorted(
         p for p in data_dir.rglob("*")
         if p.is_file() and not p.name.endswith(".part")
         and p.relative_to(data_dir).parts and p.relative_to(data_dir).parts[0] in allowed_roots
     )
     if not files:
-        raise RuntimeError("No model/packs/mtp files found under " + str(data_dir) + ".")
-    if layer:
-        log("Including the MTP draft layer in the cache (" + str(layer) + ").")
-    else:
-        log("No MTP draft layer to cache; the next session will fetch it again if drafting is enabled.")
+        raise RuntimeError("No " + "/".join(sorted(allowed_roots)) + " files found under " + str(data_dir) + ".")
     sizes = {p.relative_to(data_dir).as_posix(): p.stat().st_size for p in files}
     stage = WORKING / "strata-model-dataset-stage"
     _clean_stage(stage)
@@ -2029,6 +2100,61 @@ def upload_model_cache(data_dir: Path, username: str, slug: str, family: str, va
     total = sum(item["size"] for item in entries)
     log(f"Preparing {len(entries)} model files ({total / (1024**3):.2f} GiB) for private upload.")
     _upload_create_or_version(stage, username, slug, env, f"Update Strata model cache: {family}/{variant}")
+    return True
+
+
+def upload_draft_layer(data_dir: Path, username: str, slug: str,
+                       env: dict[str, str], force: bool = False) -> bool:
+    """Upload the MTP draft layer as its own dataset.
+
+    The layer is packed from the original BF16 checkpoint, not from a
+    quantization, so one copy serves every Qwen3.8-Flash-Next variant (Gyro,
+    Unsloth, Q2_0, IQ2_XS...). That is why it does not share a dataset with the
+    model weights: one upload instead of one per variant.
+
+    Files are stored as flat ``mtp_rt__<name>`` entries, which is the layout
+    restore_draft_layer() already reads.
+    """
+    layer = mtp_layer_path(data_dir)
+    if layer is None:
+        log("No MTP draft layer under " + str(Path(data_dir) / "mtp" / "rt")
+            + "; nothing to upload. Launch once with drafting='auto' first.")
+        return False
+    files = sorted(path for path in layer.rglob("*")
+                   if path.is_file() and not path.name.endswith(".part"))
+    if not files:
+        log("The MTP draft layer directory is empty; nothing to upload.")
+        return False
+    sizes = {path.relative_to(layer).as_posix(): path.stat().st_size for path in files}
+    expected = {"mtp/rt/" + name: size for name, size in sizes.items()}
+    attached = find_attached_dataset(username, slug, "manifest.json")
+    if attached and not force:
+        try:
+            old = json.loads((attached / "manifest.json").read_text(encoding="utf-8"))
+            old_sizes = {item["relative_path"]: int(item["size"]) for item in old.get("files", [])}
+            if old.get("format") == DRAFT_LAYER_FORMAT and old_sizes == expected:
+                log("Attached draft-layer dataset already matches; skipping duplicate upload.")
+                return False
+        except Exception:
+            pass
+
+    stage = WORKING / "strata-draft-dataset-stage"
+    _clean_stage(stage)
+    entries = []
+    for path in files:
+        relative = path.relative_to(layer).as_posix()
+        name = DRAFT_LAYER_PREFIX + relative.replace("/", "__")
+        (stage / name).symlink_to(path.resolve())
+        entries.append({"dataset_name": name, "relative_path": "mtp/rt/" + relative,
+                        "size": sizes[relative]})
+    manifest = {"format": DRAFT_LAYER_FORMAT, "contents": "mtp/rt",
+                "model_agnostic": True, "files": entries}
+    (stage / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    _write_dataset_metadata(stage, username, slug, "DevZoneX Strata MTP Draft Layer",
+                            "Private cache of the MTP draft layer, shared by all Qwen3.8-Flash-Next variants.")
+    total = sum(item["size"] for item in entries)
+    log(f"Preparing {len(entries)} draft-layer files ({total / (1024**3):.2f} GiB) for private upload.")
+    _upload_create_or_version(stage, username, slug, env, "Update Strata MTP draft layer")
     return True
 
 

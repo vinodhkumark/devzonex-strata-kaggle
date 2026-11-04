@@ -1,3 +1,4 @@
+import ast
 import os
 import hashlib
 import contextlib
@@ -19,6 +20,8 @@ from scripts.strata_kaggle import (agent_smoke, benchmark_api, environment_repor
 from scripts.strata_kaggle import find_attached_dataset, attached_datasets, dataset_mount_report
 from scripts.strata_kaggle import find_model_cache, describe_inputs
 from scripts.strata_kaggle import adopt_model_bundle, _model_source_args
+from scripts.strata_kaggle import (upload_model_cache, upload_draft_layer, cache_status,
+                                   DRAFT_LAYER_PREFIX, DRAFT_LAYER_FORMAT)
 
 
 class StrataKaggleTests(unittest.TestCase):
@@ -849,6 +852,140 @@ class ModelBundleTests(unittest.TestCase):
                     adopt_model_bundle("owner", "alpha-orionis-xs-betelgeuse",
                                        root / "local", "gyro", "gyro-s")
             self.assertIn("No .gguf", str(caught.exception))
+
+
+class UploadTests(unittest.TestCase):
+    """The model, packs and draft layer are published as separate datasets."""
+
+    def _data_dir(self, root: Path) -> Path:
+        data = root / "strata-local"
+        (data / "models" / "gyro-s").mkdir(parents=True)
+        (data / "models" / "gyro-s" / "experts.bin").write_bytes(b"model")
+        (data / "packs").mkdir()
+        (data / "packs" / "dense.pack").write_bytes(b"pack")
+        (data / "mtp" / "rt").mkdir(parents=True)
+        (data / "mtp" / "rt" / "experts.bin").write_bytes(b"draft")
+        (data / "mtp" / "rt" / "dense.bin").write_bytes(b"dense")
+        return data
+
+    def test_model_upload_excludes_the_draft_layer(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            data = self._data_dir(root)
+            stages = []
+            with patch("scripts.strata_kaggle.WORKING", root), \
+                    patch("scripts.strata_kaggle.find_attached_dataset", return_value=None), \
+                    patch("scripts.strata_kaggle._upload_create_or_version",
+                          side_effect=lambda stage, *a, **k: stages.append(stage)):
+                uploaded = upload_model_cache(data, "owner", "strata-model-gyro-gyro-s",
+                                              "gyro", "gyro-s", {}, license_confirmed=True)
+            self.assertTrue(uploaded)
+            manifest = json.loads((stages[0] / "manifest.json").read_text())
+            paths = sorted(item["relative_path"] for item in manifest["files"])
+            self.assertEqual(paths, ["models/gyro-s/experts.bin", "packs/dense.pack"])
+            self.assertFalse(any(path.startswith("mtp/") for path in paths))
+            self.assertEqual(manifest["format"], "devzonex.strata-model-cache.v1")
+            self.assertEqual(sorted(p.name for p in stages[0].iterdir()),
+                             ["0001__models__gyro-s__experts.bin", "0002__packs__dense.pack",
+                              "dataset-metadata.json", "manifest.json"])
+
+    def test_model_upload_needs_the_license_confirmation(self):
+        with tempfile.TemporaryDirectory() as td:
+            data = self._data_dir(Path(td))
+            with patch("scripts.strata_kaggle._upload_create_or_version") as upload:
+                uploaded = upload_model_cache(data, "owner", "slug", "gyro", "gyro-s", {},
+                                              license_confirmed=False)
+            self.assertFalse(uploaded)
+            upload.assert_not_called()
+
+    def test_draft_layer_upload_uses_the_flat_prefix(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            data = self._data_dir(root)
+            stages = []
+            with patch("scripts.strata_kaggle.WORKING", root), \
+                    patch("scripts.strata_kaggle.find_attached_dataset", return_value=None), \
+                    patch("scripts.strata_kaggle._upload_create_or_version",
+                          side_effect=lambda stage, *a, **k: stages.append(stage)):
+                uploaded = upload_draft_layer(data, "owner", "strata-mtp-rt", {})
+            self.assertTrue(uploaded)
+            manifest = json.loads((stages[0] / "manifest.json").read_text())
+            self.assertEqual(manifest["format"], DRAFT_LAYER_FORMAT)
+            self.assertTrue(manifest["model_agnostic"])
+            for item in manifest["files"]:
+                self.assertTrue(item["dataset_name"].startswith(DRAFT_LAYER_PREFIX))
+                self.assertIn(item["relative_path"], {"mtp/rt/experts.bin", "mtp/rt/dense.bin"})
+            self.assertTrue((stages[0] / "mtp_rt__experts.bin").is_symlink())
+
+    def test_draft_layer_upload_is_skipped_when_already_attached(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            data = self._data_dir(root)
+            attached = root / "input"
+            attached.mkdir()
+            manifest = {"format": DRAFT_LAYER_FORMAT, "model_agnostic": True, "files": [
+                {"relative_path": "mtp/rt/experts.bin", "size": 5},
+                {"relative_path": "mtp/rt/dense.bin", "size": 5},
+            ]}
+            (attached / "manifest.json").write_text(json.dumps(manifest))
+            with patch("scripts.strata_kaggle.WORKING", root), \
+                    patch("scripts.strata_kaggle.find_attached_dataset", return_value=attached), \
+                    patch("scripts.strata_kaggle._upload_create_or_version") as upload:
+                uploaded = upload_draft_layer(data, "owner", "strata-mtp-rt", {})
+            self.assertFalse(uploaded)
+            upload.assert_not_called()
+
+    def test_draft_layer_upload_without_a_layer_reports_and_stops(self):
+        with tempfile.TemporaryDirectory() as td:
+            data = Path(td) / "strata-local"
+            (data / "models").mkdir(parents=True)
+            with patch("scripts.strata_kaggle._upload_create_or_version") as upload:
+                uploaded = upload_draft_layer(data, "owner", "strata-mtp-rt", {})
+            self.assertFalse(uploaded)
+            upload.assert_not_called()
+
+
+class CacheStatusTests(unittest.TestCase):
+    def test_cache_status_counts_symlinks_and_bytes(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            data = root / "strata-local"
+            (data / "models").mkdir(parents=True)
+            (data / "models" / "real.bin").write_bytes(b"x" * 10)
+            source = root / "dataset.bin"
+            source.write_bytes(b"y" * 5)
+            (data / "models" / "linked.bin").symlink_to(source)
+            status = cache_status(data)
+            self.assertEqual(status["parts"]["models"]["files"], 2)
+            self.assertEqual(status["parts"]["models"]["links"], 1)
+            self.assertEqual(status["parts"]["models"]["bytes"], 15)
+            self.assertEqual(status["parts"]["packs"]["files"], 0)
+            self.assertFalse(status["parts"]["packs"]["exists"])
+
+    def test_environment_report_reports_the_requested_filesystem(self):
+        with tempfile.TemporaryDirectory() as td, \
+                patch("scripts.strata_kaggle.shutil.which", return_value=None):
+            report = environment_report(require_cuda=False, path=td)
+            self.assertEqual(report["disk_path"], td)
+            self.assertIsNotNone(report["disk_free_gb"])
+
+
+class DefaultRestoreModeTests(unittest.TestCase):
+    def test_symlink_is_the_default_restore_mode(self):
+        self.assertEqual(validate_config("gyro", "gyro-s", "32k")["restore_mode"],
+                         "symlink")
+
+
+class NotebookIntegrityTests(unittest.TestCase):
+    def test_every_notebook_code_cell_parses(self):
+        notebooks = Path(__file__).resolve().parent.parent / "notebooks"
+        for path in sorted(notebooks.glob("*.ipynb")):
+            notebook = json.loads(path.read_text(encoding="utf-8"))
+            for number, cell in enumerate(notebook["cells"], 1):
+                if cell["cell_type"] != "code":
+                    continue
+                with self.subTest(notebook=path.name, cell=number):
+                    ast.parse("".join(cell["source"]))
 
 
 if __name__ == "__main__":

@@ -116,10 +116,52 @@ If the cached Strata/engine build doesn't match the runtime, the helper may skip
 
 Attach your private model dataset. It should contain `manifest.json` and numbered flattened files. The notebook uses the manifest to reconstruct the model paths.
 
-- `MODEL_RESTORE_MODE = "copy"` (notebook default) copies files into `/root/strata-local`. It takes extra restore time/disk space but may improve local model reads.
-- `MODEL_RESTORE_MODE = "symlink"` links to the mounted, read-only Kaggle input files, avoiding a second full local copy. Direct reads may be slower.
+- `MODEL_RESTORE_MODE = "symlink"` (default) links to the mounted, read-only Kaggle input files, so local disk holds only the extracted runtime. Direct reads may be slower, especially for MoE expert paging.
+- `MODEL_RESTORE_MODE = "copy"` copies files into `/root/strata-local`. It takes extra restore time/disk space but may improve local model reads. An ~80 GiB model usually does not fit.
 
 **Why Add Input shows a download percentage:** Kaggle stages the attached dataset into the new runtime. For an 80-GiB model it can show progress such as `Downloaded 14/16 files: 4.5 GiB / 79.94 GiB`. This is a transfer from your Kaggle Dataset storage, not necessarily a download from the original model host. Wait until staging and the restore cell finish. If the model cache restore returns `False`, verify that the dataset slug, username and manifest match your configuration before running Strata.
+
+## Local disk fills up even though symlink mode is set
+
+Symlink mode keeps a file that already exists locally as a real copy instead of
+replacing it, so a previous `copy` restore can silently keep tens of GiB on disk.
+The log warns with the count and GiB that were kept. Inspect and clear it:
+
+```bash
+!du -sh /root/strata-local/*
+!rm -rf /root/strata-local/models /root/strata-local/packs
+```
+
+Then rerun the cache cell. `sk.cache_status(MODEL_ROOT)` prints file counts,
+bytes and symlink counts per root, so you can see which parts are real files.
+
+## A CPU session cannot create the model dataset
+
+Only the runtime restore, `strata --help` / `--plan`, and uploading files that
+already exist are CPU-safe. The model, `packs/` and the MTP layer appear only
+after `strata launch`, and the engine is compiled for the GPU it runs on
+(`sm_75` for T4). Use `notebooks/Strata_Cache_Builder.ipynb`:
+
+1. On CPU, restore the runtime and run the probe. If `strata` exposes a
+   fetch/prepare command that works without CUDA, use it.
+2. Otherwise switch to **T4 ×2**, rerun the load/restore cells (the accelerator
+   change restarts the kernel and wipes `/root`), then create and upload the
+   datasets in that same session.
+
+Changing the accelerator never preserves `/root`, so upload before ending the
+session. Uploads with the accelerator attached consume GPU wall-clock.
+
+## The draft layer is restored from the wrong dataset
+
+The MTP layer lives in its own dataset, `<your-username>/strata-mtp-rt`, and is
+shared by every Qwen3.8-Flash-Next variant. `DRAFT_LAYER_DATASET = ""` resolves
+to your own slug; it does not disable the restore. If that dataset is not
+attached, the helper logs that Strata will fetch the layer itself (~5.2 GB).
+
+Set `DRAFT_LAYER_DATASET = "owner/slug"` only to read another copy. The public
+`clothespin/strata-qfn-assets-lite` mirror is opt-in, not a default. A layer from
+a different Strata build logs a size note; the engine validates it at start.
+
 
 ## Cache upload appears frozen
 

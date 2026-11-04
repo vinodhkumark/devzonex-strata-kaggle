@@ -36,13 +36,13 @@ Our working Kaggle setup used **2 × NVIDIA Tesla T4 GPUs (about 15 GB VRAM each
 
 We use **Strata + the Gyro-S quantization**, rather than trying to load a larger, less-compressed version entirely into GPU memory. Strata manages expert weights across available VRAM and system memory; Gyro-S also keeps its large n-gram/PLE table on disk and reads relevant data as needed. That is why a model with 125B total parameters can be practical on this setup even though it would not fit as a conventional full-weight GPU-only load. The trade-off is that SSD access and memory pressure can reduce speed, and the Gyro-S quantization has lower quality than larger variants.
 
-Our model cache is about **79.94 GiB** because it includes more than the headline GGUF file: model data, expert/dense pack files, tokenizer/support assets, and a path manifest. The separate Strata runtime cache is about **1.3 GiB** in our current setup.
+Our model cache is about **79.94 GiB** because it includes more than the headline GGUF file: model data, expert/dense pack files, tokenizer/support assets, and a path manifest. That is why it gets its own dataset; the ~5.2 GiB MTP draft layer has another, and the Strata runtime cache is about **1.3 GiB**.
 
 ### Why does Kaggle still show “Downloaded” after I attach the dataset?
 
-**Add Input makes the dataset available to the notebook; it does not teleport 80 GiB onto the new runtime.** Kaggle still has to make those attached dataset files available to the session, and this notebook copies the needed files from the read-only `/kaggle/input` mount into local `/root/strata-local` so Strata can use a local model path. The progress such as `14/16 files: 4.5 GiB/79.94 GiB` is dataset transfer/restore progress, not a fresh download of the original model from its source.
+**Add Input makes the dataset available to the notebook; it does not teleport 80 GiB onto the new runtime.** Kaggle still has to make those attached dataset files available to the session. In the default `symlink` mode the notebook does **not** copy them into `/root/strata-local`; it links each file to the read-only `/kaggle/input` mount. The staging progress Kaggle shows is dataset transfer, not a fresh download of the original model from its source, and no notebook option can remove it.
 
-The benefit is **persistence and reuse**: future sessions can restore from your Kaggle Dataset instead of fetching the model from the original host and downloading the engine again. The restore still moves data from Kaggle's dataset storage into a fresh runtime, so it can take several minutes. The runtime cache is much smaller; the model cache is the large transfer.
+The benefit is **persistence and reuse**: future sessions read the model from your Kaggle Dataset instead of fetching it from the original host and recompiling the engine. Local disk holds only the extracted runtime, about 1.5 GiB instead of ~80 GiB. The trade-off is that model reads go through the input mount, which can be slower; measure it with the quality gate.
 
 
 > [!WARNING]
@@ -74,7 +74,8 @@ https://github.com/iAmAjayTeli/devzonex-strata-kaggle/blob/main/notebooks/Strata
 
 Opening the notebook imports its code; it does **not** grant access to anyone else's private datasets or secrets.
 
-- **[Open the Kaggle launcher notebook](notebooks/Strata_Kaggle_Launcher.ipynb)**
+- **[Open the Kaggle launcher notebook](notebooks/Strata_Kaggle_Launcher.ipynb)** — serves the model
+- **[Open the cache builder notebook](notebooks/Strata_Cache_Builder.ipynb)** — CPU probe, dataset creation, GPU handoff
 - [Kaggle setup checklist](docs/kaggle-setup.md)
 - [OpenCode connection guide](docs/opencode-setup.md)
 - [Troubleshooting](docs/troubleshooting.md)
@@ -177,18 +178,29 @@ VISION = "off"
 GPU_IDS = ""  # blank = auto-detect visible GPUs
 MODEL_DATA_DIR = "/root/strata-local"
 
-# "copy" uses extra local disk/time but may improve local reads (default for this tutorial).
-# Use "symlink" to avoid the second local copy; input-mount reads may be slower.
-MODEL_RESTORE_MODE = "copy"
+# "symlink" reads the model/packs/MTP from attached datasets; local disk holds
+# only the compiled runtime (~1.3 GiB). Default: an ~80 GiB model does not fit.
+# "copy" duplicates bytes locally for faster reads; needs the free disk and time.
+MODEL_RESTORE_MODE = "symlink"
+
+# The MTP draft layer has its own dataset because it is shared by every variant.
+# Blank = use your own <KAGGLE_USERNAME>/strata-mtp-rt when attached.
+DRAFT_LAYER_DATASET = ""
+DRAFT_LAYER_DATASET_SLUG = "strata-mtp-rt"
 
 # Optional: use an attached dataset that holds raw Strata model files
 # (Dense/PLE GGUFs, experts.bin, profile) instead of downloading them.
 MODEL_FILES_DATASET = ""
 
-UPLOAD_CACHES = True
+# One dataset per artifact.
+UPLOAD_CACHES = True                 # master switch
+UPLOAD_RUNTIME_CACHE = True          # ~1.3 GiB
+UPLOAD_DRAFT_LAYER = True            # ~5.2 GiB, shared by variants
+UPLOAD_MODEL_CACHE = True            # ~80 GiB
 I_CONFIRM_MODEL_LICENSE_AND_PRIVATE_STORAGE = False
 FORCE_UPDATE_MODEL_CACHE = False
 FORCE_UPDATE_RUNTIME_CACHE = False
+FORCE_UPDATE_DRAFT_LAYER = False
 
 # GPU-hour guards: the supervision cell stops Strata when nobody is using it.
 IDLE_MINUTES = 15                    # finish after this many idle minutes; 0 disables the check
@@ -213,20 +225,34 @@ connect a client; see [step 3c](#3c-optional-quality-gate).
 
 **Replace the placeholder Kaggle username.** Dataset names are derived from your configured username and model family/variant.
 
-By default the notebook plans to use these separate datasets:
+By default the notebook plans to use these separate datasets, one per artifact:
 
-- `<your-username>/strata-model-<family>-<variant>`
-- `<your-username>/strata-runtime-cache`
+- `<your-username>/strata-runtime-cache` — compiled terminal + engine (~1.3 GiB)
+- `<your-username>/strata-mtp-rt` — MTP draft layer, shared by every variant (~5.2 GiB)
+- `<your-username>/strata-model-<family>-<variant>` — `models/` + `packs/` (~80 GiB)
 
-These are user-owned caches, not global datasets shared by the project owner. Attach only datasets you own or have been granted access to.
+These are user-owned caches, not global datasets shared by the project owner. Attach only datasets you own or have been granted access to. The public `clothespin/strata-qfn-assets-lite` draft-layer mirror is opt-in only: leave `DRAFT_LAYER_DATASET` blank to use your own dataset.
 
 ### Confirm the model license before caching
 
 Keep `I_CONFIRM_MODEL_LICENSE_AND_PRIVATE_STORAGE = False` until you have checked that the model's license/terms permit making and storing a private copy in Kaggle. If the flag remains false, the model upload is skipped. Do not upload model weights to GitHub.
 
+### When the accelerator is required
+
+Build the datasets once with [`notebooks/Strata_Cache_Builder.ipynb`](notebooks/Strata_Cache_Builder.ipynb), then use the launcher for every serving session.
+
+| Phase | Accelerator | What happens |
+|---|---|---|
+| Load helpers, restore the runtime, probe `strata --help` and `--plan` | **None (CPU)** | no CUDA needed; the plan is cheap and lists the real files and sizes |
+| Compile the engine, fetch the model, build `packs/`, fetch the MTP layer | **GPU (T4 ×2)** | the engine is compiled for the GPU it runs on (`sm_75` for T4), and `strata launch` performs the fetch |
+| Upload datasets that already exist | None (CPU) | upload is file I/O; use it to re-publish an attached bundle |
+| Normal serving session | **GPU (T4 ×2)** | run the launcher |
+
+A CPU session cannot create the model dataset from nothing: the files only exist after `strata launch`, which needs a GPU. Switching the accelerator restarts the kernel and wipes `/root`, so run the upload cell in the same session that produced the files. Uploads also consume GPU wall-clock when the accelerator is attached.
+
 ## 4. Run the notebook cells in order
 
-1. **Load helpers and credentials** — clones the repository's scripts and reads your Kaggle Secret. It also validates the configuration and reports GPU, RAM and free disk before a long launch.
+1. **Load helpers and credentials** — clones the repository's scripts and reads your Kaggle Secret. It also validates the configuration and reports GPU, RAM and free disk before a long launch. Free disk is reported for `MODEL_DATA_DIR`, which is the filesystem the model would land on — not `/kaggle/working`.
 2. **Restore caches or install Strata** — uses attached private datasets when available; installs Strata if not.
 3. **Review plan** — inspect Strata's plan and confirm the selected model, engine, context, and GPU setup before downloading.
 4. **Launch Strata** — fetches missing compatible model/engine files on a first run.
@@ -294,8 +320,9 @@ If an unauthenticated public request succeeds with HTTP `200`, stop the tunnel a
 
 | Cache dataset | What's saved | Purpose |
 |---|---|---|
-| Model cache | Model weights/support files plus path-and-size manifest | Avoid re-downloading model assets from their original source |
-| Runtime cache | Strata terminal, engine components, manifest/checksum, and optionally Cloudflare Tunnel binary | Avoid re-downloading the same compatible runtime build |
+| Model cache (`strata-model-<family>-<variant>`) | `models/` + `packs/` plus path-and-size manifest | Avoid re-downloading model assets from their original source |
+| Draft layer (`strata-mtp-rt`) | `mtp/rt/` as flat `mtp_rt__*` files plus manifest | Fetch the ~5.2 GiB MTP layer once for every variant |
+| Runtime cache (`strata-runtime-cache`) | Strata terminal, engine components, manifest/checksum, and optionally Cloudflare Tunnel binary | Avoid recompiling the engine (~10–15 min) and re-downloading the same compatible runtime build |
 
 The notebook creates datasets without a public-visibility flag. Verify each dataset's visibility and file list on Kaggle. “Upload successful” means the files transferred; it does not necessarily mean Kaggle finished processing the dataset.
 
@@ -333,21 +360,23 @@ an always-on production server.
 # 🔁 Restore on a later Kaggle session
 
 1. Reopen the notebook and enable Internet/GPU.
-2. Use **Add Input** to attach your own model and runtime cache datasets.
+2. Use **Add Input** to attach your own runtime, model and draft-layer datasets (`strata-runtime-cache`, `strata-model-<family>-<variant>`, `strata-mtp-rt`).
 3. Enable the `KAGGLE_API_TOKEN` Secret for this notebook.
 4. Keep the model family/variant and username consistent with your cache names.
 5. Run the notebook from top to bottom.
 
-The model dataset uses a `manifest.json`; the runtime dataset contains `strata-runtime-cache.bin`, `strata-runtime-cache.bin.sha256`, and `runtime-manifest.json`.
+The model dataset uses a `manifest.json`; the runtime dataset contains `strata-runtime-cache.bin`, `strata-runtime-cache.bin.sha256`, and `runtime-manifest.json`; the draft-layer dataset uses `mtp_rt__*` files plus a `manifest.json`.
 
 The notebook verifies the manifest and file sizes, then uses the `MODEL_RESTORE_MODE` option:
 
-- `"copy"` (default for this tutorial): copies the model files into `/root/strata-local`. This takes extra restore time and disk space, but may provide faster local file access.
-- `"symlink"`: creates links in `/root/strata-local` to the attached read-only Kaggle dataset, avoiding the second full local copy. Reads from the input mount may be slower.
+- `"symlink"` (default): creates links in `/root/strata-local` to the attached read-only Kaggle datasets, so local disk holds only the extracted runtime (~1.3 GiB). Reads from the input mount may be slower, especially for MoE expert paging.
+- `"copy"`: copies the model files into `/root/strata-local`. This takes extra restore time and disk space, but may provide faster local file access. It is usually impossible for a ~80 GiB model on Kaggle's local disk.
 
-**Why Add Input can still show a download progress bar:** Kaggle must make the selected dataset files available to the fresh runtime; this is a transfer from your Kaggle Dataset storage into that notebook session, not the same as downloading the model again from its original model host. No notebook option can eliminate this input-staging step.
+If an earlier `copy` restore left real files behind, `symlink` mode keeps them and logs a warning with the disk they still occupy. Delete `MODEL_DATA_DIR/models` (and `packs`, `mtp`) before restoring if you want symlink-only storage.
 
-With `MODEL_RESTORE_MODE = "copy"` (the notebook default), the helper copies files into `/root/strata-local`, using extra restore time and disk space but potentially improving local-read performance. With `MODEL_RESTORE_MODE = "symlink"`, the helper creates links to the attached read-only `/kaggle/input` files and avoids the second full local copy, but reading from the mount may be slower. In either mode, wait for Kaggle's input staging and the restore cell to finish before launching Strata. The goal is to avoid downloading the model from its original host again—not to eliminate every transfer.
+**Why Add Input can still show a download progress bar:** Kaggle must make the selected dataset files available to the fresh runtime; this is a transfer from your Kaggle Dataset storage into that notebook session, not the same as downloading the model again from its original model host. No notebook option can eliminate this input-staging step. `symlink` avoids only the second copy to local disk.
+
+Measure the trade-off once with `RUN_QUALITY_GATE = True`. If decode tokens/s are unacceptable in symlink mode, copy only `models/` while symlinking `packs/` and `mtp/` — but that needs the free disk the default design avoids.
 
 Runtime caches may not be compatible after a Strata, engine, OS, CUDA, or GPU change. Review the plan again and allow Strata to fetch a compatible component when needed.
 

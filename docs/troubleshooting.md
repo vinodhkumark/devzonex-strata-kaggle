@@ -135,18 +135,24 @@ The log warns with the count and GiB that were kept. Inspect and clear it:
 Then rerun the cache cell. `sk.cache_status(MODEL_ROOT)` prints file counts,
 bytes and symlink counts per root, so you can see which parts are real files.
 
-## A CPU session cannot create the model dataset
+## A CPU session cannot serve the model
 
-Only the runtime restore, `strata --help` / `--plan`, and uploading files that
-already exist are CPU-safe. The model, `packs/` and the MTP layer appear only
-after `strata launch`, and the engine is compiled for the GPU it runs on
-(`sm_75` for T4). Use `notebooks/Strata_Cache_Builder.ipynb`:
+Only the runtime restore, the plan/probe and dataset preparation are CPU-safe.
+The engine is compiled for the GPU it runs on (`sm_75` for T4), so serving
+requires an accelerator.
+
+Use `notebooks/Strata_Cache_Builder.ipynb`:
 
 1. On CPU, restore the runtime and run the probe. If `strata` exposes a
    fetch/prepare command that works without CUDA, use it.
-2. Otherwise switch to **T4 ×2**, rerun the load/restore cells (the accelerator
-   change restarts the kernel and wipes `/root`), then create and upload the
-   datasets in that same session.
+2. Otherwise try `strata install … --no-start` (the explicit installer; it
+   downloads the model and MTP layer, prepares packs, and writes a run config
+   without starting). If that stops at the engine step, try
+   `strata launch … --yes --no-tui`, which Strata documents to download the model
+   even when no engine is usable for the computer.
+3. If neither produces files, switch to **T4 ×2**, rerun the load/restore cells
+   (the accelerator change restarts the kernel and wipes `/root`), then create and
+   upload the datasets in that same session.
 
 Changing the accelerator never preserves `/root`, so upload before ending the
 session. Uploads with the accelerator attached consume GPU wall-clock.

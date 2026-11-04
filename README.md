@@ -244,11 +244,13 @@ Build the datasets once with [`notebooks/Strata_Cache_Builder.ipynb`](notebooks/
 | Phase | Accelerator | What happens |
 |---|---|---|
 | Load helpers, restore the runtime, probe `strata --help` and `--plan` | **None (CPU)** | no CUDA needed; the plan is cheap and lists the real files and sizes |
-| Compile the engine, fetch the model, build `packs/`, fetch the MTP layer | **GPU (T4 ×2)** | the engine is compiled for the GPU it runs on (`sm_75` for T4), and `strata launch` performs the fetch |
-| Upload datasets that already exist | None (CPU) | upload is file I/O; use it to re-publish an attached bundle |
+| Fetch the model, the draft layer and prepare packs | **None (CPU), in most builds** | `strata install … --no-start` runs `setup.py` without starting; `strata launch … --yes` is documented to download even when no engine is usable. Then upload from the same CPU session |
+| Compile a compatible engine and serve | **GPU (T4 ×2)** | the engine is compiled for the GPU it runs on (`sm_75` for T4); the runtime dataset already provides a matching one |
 | Normal serving session | **GPU (T4 ×2)** | run the launcher |
 
-A CPU session cannot create the model dataset from nothing: the files only exist after `strata launch`, which needs a GPU. Switching the accelerator restarts the kernel and wipes `/root`, so run the upload cell in the same session that produced the files. Uploads also consume GPU wall-clock when the accelerator is attached.
+A CPU session cannot *serve* a model, and if neither CPU prepare mode downloads anything, the model must be fetched in a GPU session instead. Switching the accelerator restarts the kernel and wipes `/root`, so run the upload cell in the same session that produced the files. Uploads also consume GPU wall-clock when the accelerator is attached.
+
+Use [`notebooks/Strata_Cache_Builder.ipynb`](notebooks/Strata_Cache_Builder.ipynb) for the CPU probe, the prepare attempt and the upload; use the launcher for serving.
 
 ## 4. Run the notebook cells in order
 

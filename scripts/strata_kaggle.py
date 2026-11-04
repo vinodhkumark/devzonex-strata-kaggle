@@ -289,29 +289,44 @@ def find_attached_dataset(owner: str, slug: str, marker: str | None = None) -> P
     return None
 
 
+def _looks_like_dataset(path: Path) -> bool:
+    """A mounted dataset contains files; a grouping folder contains only folders.
+
+    Older Kaggle mounts include dataset-metadata.json, newer ones do not, so the
+    presence of any regular file is the reliable signal. This keeps
+    /kaggle/input/datasets/<owner> from being reported as a dataset while still
+    working when the owner folder is absent.
+    """
+    if (path / "dataset-metadata.json").is_file():
+        return True
+    try:
+        return any(entry.is_file() or entry.is_symlink() for entry in path.iterdir())
+    except OSError:
+        return False
+
+
 def attached_datasets() -> list[Path]:
     """Dataset directories mounted right now, without walking their files.
 
-    Kaggle writes dataset-metadata.json into every mounted dataset, so checking
-    the two mount layouts is enough. Walking the mount instead would read tens of
-    gigabytes of model files just to answer "is it attached?".
+    Only the two mount layouts are inspected (root/slug and root/owner/slug), so
+    this stays cheap even when a dataset holds tens of gigabytes of weights.
     """
     found: list[Path] = []
     for root in _dataset_roots():
         if not root.is_dir():
             continue
         try:
-            first_level = sorted(p for p in root.iterdir() if p.is_dir())
+            first_level = sorted(path for path in root.iterdir() if path.is_dir())
         except OSError:
             continue
         for first in first_level:
             candidates = [first]
             try:
-                candidates += sorted(p for p in first.iterdir() if p.is_dir())
+                candidates += sorted(path for path in first.iterdir() if path.is_dir())
             except OSError:
                 pass
             for path in candidates:
-                if path not in found and (path / "dataset-metadata.json").is_file():
+                if path not in found and _looks_like_dataset(path):
                     found.append(path)
     return found
 
@@ -843,6 +858,48 @@ def restore_model_cache(owner: str, slug: str, data_dir: Path, workers: int = 8,
     log("Model cache copied into local storage and size-verified.")
     return True
 
+
+
+def adopt_model_bundle(owner: str, slug: str, data_dir: Path, family: str, variant: str,
+                       restore_mode: str = "symlink") -> Path:
+    """Use a dataset that holds a model's raw Strata files instead of downloading it.
+
+    Some Kaggle datasets store a model as the files Strata itself works with (the
+    Dense/PLE GGUFs, experts.bin, a profile) rather than this notebook's cache
+    format, which has a manifest. Strata accepts a local directory via
+    --model-path, so those files are staged under models/<family>-<variant> and
+    the launch uses that directory.
+
+    Nothing here validates that the bundle is the selected model: it carries no
+    manifest, and only Strata's loader can decide. If it is the wrong one, the
+    launch fails loudly instead of serving a different model.
+    """
+    if restore_mode not in {"copy", "symlink"}:
+        raise ValueError("restore_mode must be 'copy' or 'symlink'.")
+    dataset = find_attached_dataset(owner, slug)
+    if dataset is None:
+        raise RuntimeError(
+            "Model-files dataset " + owner + "/" + slug + " is not attached. Add it with "
+            "Add Input, or clear MODEL_FILES_DATASET to download the model instead.")
+    files = sorted(path for path in dataset.iterdir()
+                   if path.is_file() and not path.name.endswith(".part"))
+    if not any(path.suffix == ".gguf" for path in files):
+        raise RuntimeError("No .gguf file found in " + str(dataset)
+                           + "; this does not look like a Strata model directory.")
+    target = Path(data_dir) / "models" / (family + "-" + variant)
+    target.mkdir(parents=True, exist_ok=True)
+    for source in files:
+        destination = target / source.name
+        if restore_mode == "symlink":
+            if destination.is_symlink() and destination.resolve() == source.resolve():
+                continue
+            destination.unlink(missing_ok=True)
+            destination.symlink_to(source)
+        elif not destination.is_file() or destination.stat().st_size != source.stat().st_size:
+            _copy_verified(source, destination, None)
+    log("Using " + str(len(files)) + " attached model files from " + str(dataset)
+        + " via " + str(target) + " (" + restore_mode + ").")
+    return target
 
 
 def _cached_model_path(data_dir: Path, family: str, variant: str) -> Path | None:

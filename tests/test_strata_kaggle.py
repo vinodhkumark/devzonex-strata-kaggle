@@ -18,6 +18,7 @@ from scripts.strata_kaggle import (agent_smoke, benchmark_api, environment_repor
                                    validate_config)
 from scripts.strata_kaggle import find_attached_dataset, attached_datasets, dataset_mount_report
 from scripts.strata_kaggle import find_model_cache, describe_inputs
+from scripts.strata_kaggle import adopt_model_bundle, _model_source_args
 
 
 class StrataKaggleTests(unittest.TestCase):
@@ -749,6 +750,17 @@ class ModelDiscoveryTests(unittest.TestCase):
             self.assertEqual(found[0], expected)
 
 
+    def test_attached_datasets_detects_mounts_without_metadata(self):
+        # Newer Kaggle mounts contain no dataset-metadata.json; files are enough.
+        with tempfile.TemporaryDirectory() as td:
+            input_root = Path(td) / "input" / "datasets"
+            owner = input_root / "kvinodhkumar"
+            runtime = owner / "strata-runtime-cache"
+            runtime.mkdir(parents=True)
+            (runtime / "strata-runtime-cache.bin").write_bytes(b"r" * 10)
+            with patch("scripts.strata_kaggle.INPUT_ROOT", input_root):
+                self.assertEqual(attached_datasets(), [runtime])
+
     def test_describe_inputs_reports_what_each_dataset_holds(self):
         with tempfile.TemporaryDirectory() as td:
             input_root = Path(td) / "input" / "datasets"
@@ -773,6 +785,70 @@ class ModelDiscoveryTests(unittest.TestCase):
             self.assertEqual(report["alpha-orionis-xs-betelgeuse"]["model_cache"]["family"],
                              "gyro")
             self.assertEqual(report["alpha-orionis-xs-betelgeuse"]["model_cache"]["files"], 1)
+
+
+class ModelBundleTests(unittest.TestCase):
+    def _bundle(self, root, files):
+        input_root = root / "input" / "datasets"
+        bundle = input_root / "owner" / "alpha-orionis-xs-betelgeuse"
+        bundle.mkdir(parents=True)
+        for name, payload in files.items():
+            (bundle / name).write_bytes(payload)
+        return input_root, bundle
+
+    def test_adopted_bundle_makes_the_launch_use_a_local_model_path(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            input_root, _bundle = self._bundle(root, {
+                "Qwen3.8-Flash-Next-Dense.gguf": b"dense",
+                "Qwen3.8-Flash-Next-PLE.gguf": b"ple",
+                "experts.bin": b"experts",
+                "profile-qwen4exp.bin": b"profile",
+            })
+            with patch("scripts.strata_kaggle.INPUT_ROOT", input_root):
+                target = adopt_model_bundle("owner", "alpha-orionis-xs-betelgeuse",
+                                            root / "local", "gyro", "gyro-s")
+                self.assertEqual(target, root / "local" / "models" / "gyro-gyro-s")
+                self.assertTrue((target / "experts.bin").is_symlink())
+                self.assertEqual((target / "experts.bin").read_bytes(), b"experts")
+                self.assertEqual(sorted(path.name for path in target.iterdir()),
+                                 ["Qwen3.8-Flash-Next-Dense.gguf",
+                                  "Qwen3.8-Flash-Next-PLE.gguf",
+                                  "experts.bin", "profile-qwen4exp.bin"])
+                self.assertEqual(_model_source_args(root / "local", "gyro", "gyro-s"),
+                                 ["--model-path", str(target)])
+
+    def test_adopted_bundle_can_be_copied(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            input_root, _bundle = self._bundle(root, {
+                "model.gguf": b"w" * 32, "experts.bin": b"e" * 8})
+            with patch("scripts.strata_kaggle.INPUT_ROOT", input_root):
+                target = adopt_model_bundle("owner", "alpha-orionis-xs-betelgeuse",
+                                            root / "local", "gyro", "gyro-s",
+                                            restore_mode="copy")
+            self.assertFalse((target / "model.gguf").is_symlink())
+            self.assertEqual((target / "model.gguf").read_bytes(), b"w" * 32)
+
+    def test_adopting_a_missing_dataset_explains_what_to_do(self):
+        with tempfile.TemporaryDirectory() as td:
+            input_root = Path(td) / "input" / "datasets"
+            input_root.mkdir(parents=True)
+            with patch("scripts.strata_kaggle.INPUT_ROOT", input_root):
+                with self.assertRaises(RuntimeError) as caught:
+                    adopt_model_bundle("owner", "absent", Path(td) / "local",
+                                       "gyro", "gyro-s")
+            self.assertIn("not attached", str(caught.exception))
+
+    def test_a_bundle_without_a_gguf_is_rejected(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            input_root, _bundle = self._bundle(root, {"experts.bin": b"e"})
+            with patch("scripts.strata_kaggle.INPUT_ROOT", input_root):
+                with self.assertRaises(RuntimeError) as caught:
+                    adopt_model_bundle("owner", "alpha-orionis-xs-betelgeuse",
+                                       root / "local", "gyro", "gyro-s")
+            self.assertIn("No .gguf", str(caught.exception))
 
 
 if __name__ == "__main__":

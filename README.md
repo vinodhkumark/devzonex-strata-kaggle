@@ -181,6 +181,10 @@ MODEL_DATA_DIR = "/root/strata-local"
 # Use "symlink" to avoid the second local copy; input-mount reads may be slower.
 MODEL_RESTORE_MODE = "copy"
 
+# Optional: use an attached dataset that holds raw Strata model files
+# (Dense/PLE GGUFs, experts.bin, profile) instead of downloading them.
+MODEL_FILES_DATASET = ""
+
 UPLOAD_CACHES = True
 I_CONFIRM_MODEL_LICENSE_AND_PRIVATE_STORAGE = False
 FORCE_UPDATE_MODEL_CACHE = False
@@ -231,6 +235,30 @@ Keep `I_CONFIRM_MODEL_LICENSE_AND_PRIVATE_STORAGE = False` until you have checke
 7. **Upload private caches** — stores the model and runtime separately, if enabled and permitted.
 8. **Print OpenCode config** — provides the current URL/model/provider snippet.
 9. **Supervise and release** — watches request activity and stops Strata when idle.
+
+### 3a. Optional: use model files from an attached dataset
+
+If an attached dataset already holds the model as raw Strata files (`*-Dense.gguf`,
+`*-PLE.gguf`, `experts.bin`, a `profile-*.bin`), set:
+
+```python
+MODEL_FILES_DATASET = "your-username/the-dataset-slug"   # owner may be omitted
+```
+
+The cache cell symlinks those files into `MODEL_DATA_DIR/models/<family>-<variant>`,
+and the launch passes `--model-path` there, so Strata skips downloading the model.
+
+Two caveats, both deliberate:
+
+- **No manifest means no verification.** These bundles carry no record of which
+  family/variant they belong to, so the notebook cannot check that they match
+  `MODEL_FAMILY`/`MODEL_VARIANT`. Strata's loader is what decides, and a mismatch
+  fails at launch instead of serving a different model.
+- **Symlinks are the default** because a bundle can be far larger than local disk.
+  Reads go through the `/kaggle/input` mount, which is slower than a local copy.
+
+This is separate from the model **cache** created by the upload cell, which does
+have a `manifest.json` and is preferred when present.
 
 ### 3b. Optional: measure the drafter
 

@@ -77,6 +77,23 @@ this format — the weights may have been uploaded as plain files instead. Attac
 dataset produced by the notebook's upload cell, or let Strata download the model
 once and save it with `I_CONFIRM_MODEL_LICENSE_AND_PRIVATE_STORAGE = True`.
 
+## The weights are attached as plain files, without a manifest
+
+A dataset can hold a model as its raw Strata files (`*-Dense.gguf`, `*-PLE.gguf`,
+`experts.bin`, `profile-*.bin`) with no `manifest.json`. The notebook's model
+cache requires that manifest, so those files are ignored by default.
+
+Point the launch at them instead:
+
+```python
+MODEL_FILES_DATASET = "your-username/the-dataset-slug"   # owner may be omitted
+```
+
+The cache cell symlinks the files into `MODEL_DATA_DIR/models/<family>-<variant>`
+and the launch uses `--model-path`. If the launch then rejects the model, the
+bundle does not match `MODEL_FAMILY`/`MODEL_VARIANT` — clear the setting and let
+Strata download the correct files.
+
 ## Model family or variant is unsupported
 
 Run the notebook's Strata plan cell and choose a family/variant accepted by the installed Strata release. Not every Hugging Face model is compatible with Strata. Review the plan before approving large downloads.

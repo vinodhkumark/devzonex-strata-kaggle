@@ -729,10 +729,18 @@ if config.get("model_path"):
     given = Path(config["model_path"]).expanduser()
     if given.is_dir():
         found = sorted(p for p in given.glob("*.gguf") if p.is_file())
-        if len(found) != 1:
-            raise SystemExit("expected exactly one .gguf in " + str(given)
-                             + ", found " + str(len(found)))
-        model_path = found[0]
+        if not found:
+            raise SystemExit("no .gguf in " + str(given))
+        if len(found) == 1:
+            model_path = found[0]
+        else:
+            # A multi-shard model: iq_pack reads the other shards beside the
+            # first one, so point it at -00001-of-NNNNN.
+            first = [p for p in found if "-00001-of-" in p.name]
+            if len(first) != 1:
+                raise SystemExit("more than one .gguf in " + str(given)
+                                 + " and no single first shard; give the folder of one model")
+            model_path = first[0]
     elif given.is_file():
         model_path = given
     else:

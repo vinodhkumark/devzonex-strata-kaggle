@@ -1176,6 +1176,36 @@ class CpuPrepareTests(unittest.TestCase):
             self.assertTrue(summary["pack_ok"])
             self.assertEqual(summary["model_bytes"], 8)
 
+    def test_generated_script_uses_the_first_shard_of_a_multi_shard_bundle(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            bundle = root / "input" / "bundle"
+            bundle.mkdir(parents=True)
+            (bundle / "model-00001-of-00002.gguf").write_bytes(b"a" * 8)
+            (bundle / "model-00002-of-00002.gguf").write_bytes(b"b" * 4)
+            fake_setup = root / "setup.py"
+            fake_setup.write_text(
+                "from pathlib import Path\n"
+                "FAMILIES = {'qwen': {'tag': '', 'hf': 'http://example.invalid/', 'file': '{q}-0000{i}-of-00002.gguf'}}\n"
+                "def model_file(fam, model, i): return 'model-0000%d-of-00002.gguf' % i\n"
+                "def get_llama_cpp(): return '.'\n"
+                "def run(cmd, env=None):\n"
+                "    out = Path(cmd[cmd.index('--out') + 1])\n"
+                "    (out / 'tokenizer').mkdir(parents=True, exist_ok=True)\n"
+                "    (out / 'tokenizer' / 'vocab.json').write_text('{}')\n"
+                "    (out / 'native_experts.txt').write_text('')\n",
+                encoding="utf-8")
+            with patch.object(strata_kaggle, "WORKING", root / "working"), \
+                    patch.object(strata_kaggle, "find_strata_setup", return_value=fake_setup), \
+                    patch.object(strata_kaggle, "strata_terminal_python", return_value=sys.executable):
+                summary = prepare_model_on_cpu(
+                    root / "data", "qwen", "iq3-xxs",
+                    download_model=False, build_pack=True, fetch_draft=False,
+                    model_path=bundle)
+            self.assertEqual(summary["returncode"], 0)
+            self.assertTrue(summary["pack_ok"])
+            self.assertEqual(summary["model_bytes"], 8)
+
     def test_generated_script_accepts_a_lowercase_adopted_folder(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

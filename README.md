@@ -226,6 +226,14 @@ Set `SERVE_MINUTES = 0` (the default) when you want only the idle check.
 will upload from; copying between them needs twice the space. The CPU download
 is ~63.7 GB decimal, about 59.3 GiB, which is what `df` reports.
 
+Kaggle's whole writable layer is about **70 GB**, and Kaggle staff recommend
+staying under ~60 GB. `df` can show the host's multi-terabyte overlay instead;
+that is not the notebook's quota. A Gyro-S one-pass download peaks near 63 GiB,
+so use the two-pass flow in section 3c: upload the model, wait for **Ready**,
+delete `models/` and `packs/`, then build and upload the draft layer. Do the
+same rotation to try another model, because two ~58 GB models cannot coexist in
+one session. Each model has its own dataset; attach only the one you are serving.
+
 `RUN_QUALITY_GATE = True` runs a benchmark and a tool-calling check before you
 connect a client; see [step 3c](#3c-optional-quality-gate).
 

@@ -152,11 +152,18 @@ Use `notebooks/Strata_Cache_Builder.ipynb`:
 3. If the cell reports that a helper is missing, switch to **T4 ×2**, rerun the
    load/restore cells (the accelerator change restarts the kernel and wipes
    `/root`), then create and upload the datasets in that same session.
-4. If free disk is below roughly 65 GiB, use the two-pass flow in section 3c:
-   build and upload the model with `CPU_FETCH_DRAFT = False`, wait for the
-   dataset to be **Ready**, delete `models/` and `packs/`, then run the cell
-   again with `CPU_DOWNLOAD_MODEL = False`, `CPU_BUILD_PACK = False` and
+4. If free disk is below roughly 65 GiB, or if you are preparing Gyro-S, use the
+   two-pass flow in section 3c: build and upload the model with
+   `CPU_FETCH_DRAFT = False`, wait for the dataset to be **Ready**, delete
+   `models/` and `packs/`, then run the cell again with
+   `CPU_DOWNLOAD_MODEL = False`, `CPU_BUILD_PACK = False` and
    `CPU_FETCH_DRAFT = True`. The draft-only pass does not need the GGUF.
+
+Kaggle's writable layer is about 70 GB even when `df` shows the host's
+multi-terabyte overlay, and staff recommend staying under ~60 GB. `/kaggle/temp`
+and `/root` share that layer; `/kaggle/working` is a 20 GB output quota inside
+it. Two ~58 GB models cannot coexist, so upload one, wait for **Ready**, delete
+it, and repeat for the next model.
 
 Changing the accelerator never preserves `/root`, so upload before ending the
 session. Uploads with the accelerator attached consume GPU wall-clock.

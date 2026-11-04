@@ -259,17 +259,33 @@ def default_gpu_list() -> str:
     return ",".join(str(i) for i in range(len(names))) if names else "0"
 
 
+def _dataset_roots() -> list[Path]:
+    """Every root Kaggle may mount an attached dataset under.
+
+    Datasets usually appear as <root>/<owner>/<slug>, and older or competition
+    style mounts use <root>/<slug>. Kaggle has used both /kaggle/input and
+    /kaggle/input/datasets as the root, so search both instead of assuming one.
+    """
+    roots = [INPUT_ROOT]
+    parent = INPUT_ROOT.parent
+    if parent != INPUT_ROOT and parent.is_dir():
+        roots.append(parent)
+    return roots
+
+
 def find_attached_dataset(owner: str, slug: str, marker: str | None = None) -> Path | None:
-    exact = INPUT_ROOT / owner / slug
-    if exact.is_dir() and (marker is None or (exact / marker).is_file()):
-        return exact
-    if not INPUT_ROOT.exists():
-        return None
+    for root in _dataset_roots():
+        for candidate in (root / owner / slug, root / slug):
+            if candidate.is_dir() and (marker is None or (candidate / marker).is_file()):
+                return candidate
     marker_name = marker or "dataset-metadata.json"
-    for candidate in INPUT_ROOT.rglob(marker_name):
-        parent = candidate.parent
-        if parent.name == slug and (parent.parent.name == owner or owner in parent.parts):
-            return parent
+    for root in _dataset_roots():
+        if not root.is_dir():
+            continue
+        for candidate in root.rglob(marker_name):
+            parent = candidate.parent
+            if parent.name == slug and (parent.parent.name == owner or owner in parent.parts):
+                return parent
     return None
 
 
@@ -993,13 +1009,14 @@ MIN_DRAFT_LAYER_BYTES = 64 * 1024 * 1024
 def _dataset_dirs(owner: str, slug: str) -> list[Path]:
     """Every place an attached Kaggle dataset for owner/slug may be mounted."""
     candidates: list[Path] = []
-    for path in (INPUT_ROOT / owner / slug, INPUT_ROOT / slug):
-        if path.is_dir():
-            candidates.append(path)
-    if INPUT_ROOT.exists():
-        for path in sorted(INPUT_ROOT.rglob(slug)):
+    for root in _dataset_roots():
+        for path in (root / owner / slug, root / slug):
             if path.is_dir() and path not in candidates:
                 candidates.append(path)
+        if root.is_dir():
+            for path in sorted(root.rglob(slug)):
+                if path.is_dir() and path not in candidates:
+                    candidates.append(path)
     return candidates
 
 

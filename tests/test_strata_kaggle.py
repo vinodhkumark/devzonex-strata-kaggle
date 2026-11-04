@@ -15,6 +15,7 @@ from scripts.strata_kaggle import (_drafting_args, drafting_status, mtp_layer_pa
 from scripts.strata_kaggle import (agent_smoke, benchmark_api, environment_report,
                                    publish_connection, session_identity, serve_until_idle,
                                    validate_config)
+from scripts.strata_kaggle import find_attached_dataset
 
 
 class StrataKaggleTests(unittest.TestCase):
@@ -594,6 +595,50 @@ class ModelManifestSafetyTests(unittest.TestCase):
                     restore_model_cache("test-owner", "strata-model-gyro-gyro-s",
                                         root / "local-model", family="gyro",
                                         variant="gyro-s", restore_mode="copy")
+
+
+class DatasetMountTests(unittest.TestCase):
+    def test_finds_a_dataset_mounted_without_the_owner_folder(self):
+        with tempfile.TemporaryDirectory() as td:
+            input_root = Path(td) / "input" / "datasets"
+            input_root.mkdir(parents=True)
+            flat = Path(td) / "input" / "strata-model-gyro-gyro-s"
+            flat.mkdir(parents=True)
+            (flat / "manifest.json").write_text("{}", encoding="utf-8")
+            with patch("scripts.strata_kaggle.INPUT_ROOT", input_root):
+                found = find_attached_dataset("owner", "strata-model-gyro-gyro-s", "manifest.json")
+            self.assertEqual(found, flat)
+
+    def test_finds_the_owner_slug_layout(self):
+        with tempfile.TemporaryDirectory() as td:
+            input_root = Path(td) / "input" / "datasets"
+            nested = input_root / "owner" / "strata-runtime-cache"
+            nested.mkdir(parents=True)
+            (nested / "runtime-manifest.json").write_text("{}", encoding="utf-8")
+            with patch("scripts.strata_kaggle.INPUT_ROOT", input_root):
+                found = find_attached_dataset("owner", "strata-runtime-cache",
+                                              "runtime-manifest.json")
+            self.assertEqual(found, nested)
+
+    def test_missing_dataset_returns_none(self):
+        with tempfile.TemporaryDirectory() as td:
+            input_root = Path(td) / "input" / "datasets"
+            input_root.mkdir(parents=True)
+            with patch("scripts.strata_kaggle.INPUT_ROOT", input_root):
+                self.assertIsNone(find_attached_dataset("owner", "absent", "manifest.json"))
+
+    def test_draft_layer_is_found_from_a_flat_mount(self):
+        with tempfile.TemporaryDirectory() as td:
+            input_root = Path(td) / "input" / "datasets"
+            input_root.mkdir(parents=True)
+            flat = Path(td) / "input" / "strata-qfn-assets-lite"
+            flat.mkdir(parents=True)
+            (flat / "mtp_rt__experts.bin").write_bytes(b"e" * 4096)
+            with patch("scripts.strata_kaggle.INPUT_ROOT", input_root):
+                restored = restore_draft_layer("clothespin", "strata-qfn-assets-lite",
+                                               Path(td) / "local", min_experts_bytes=1)
+            self.assertTrue(restored)
+            self.assertTrue((Path(td) / "local" / "mtp" / "rt" / "experts.bin").is_file())
 
 
 if __name__ == "__main__":

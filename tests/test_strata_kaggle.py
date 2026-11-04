@@ -21,7 +21,8 @@ from scripts.strata_kaggle import find_attached_dataset, attached_datasets, data
 from scripts.strata_kaggle import find_model_cache, describe_inputs
 from scripts.strata_kaggle import adopt_model_bundle, _model_source_args
 from scripts.strata_kaggle import (upload_model_cache, upload_draft_layer, cache_status,
-                                   DRAFT_LAYER_PREFIX, DRAFT_LAYER_FORMAT)
+                                   DRAFT_LAYER_PREFIX, DRAFT_LAYER_FORMAT,
+                                   setup_model_name)
 
 
 class StrataKaggleTests(unittest.TestCase):
@@ -986,6 +987,18 @@ class NotebookIntegrityTests(unittest.TestCase):
                     continue
                 with self.subTest(notebook=path.name, cell=number):
                     ast.parse("".join(cell["source"]))
+
+
+class SetupModelNameTests(unittest.TestCase):
+    def test_launch_spelling_maps_to_setup_spelling(self):
+        self.assertEqual(setup_model_name("gyro-s"), "Gyro-S")
+        self.assertEqual(setup_model_name("GYRO-M"), "Gyro-M")
+        self.assertEqual(setup_model_name("q2_0"), "Q2_0")
+        self.assertEqual(setup_model_name("ud-q4_k_xl"), "UD-Q4_K_XL")
+
+    def test_unknown_names_pass_through(self):
+        self.assertEqual(setup_model_name("tomorrow-model"), "tomorrow-model")
+        self.assertEqual(setup_model_name(""), "")
 
 
 if __name__ == "__main__":

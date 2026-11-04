@@ -940,6 +940,33 @@ def _model_source_args(data_dir: Path, family: str, variant: str) -> list[str]:
 
 
 DRAFTING_MODES = ("auto", "mtp", "dflash2", "off")
+
+#: Model names setup.py accepts via ``strata install``. argparse matches these
+#: exactly, while ``strata launch`` normalizes case, so "gyro-s" works for a
+#: launch and fails as an install choice.
+SETUP_MODEL_CHOICES = (
+    "Q2_0", "IQ2_XS", "IQ3_XXS", "IQ3_S", "IQ1_M",
+    "UD-IQ4_XS", "UD-Q4_K_XL", "UD-Q5_K_XL", "UD-Q6_K_XL", "Q8_0",
+    "Gyro-S", "Gyro-M",
+    "NVFP4", "NVFP4-NVIDIA", "NVFP4-QAD",
+    "IST-DAS-2.00bpw", "IST-DAS-2.25bpw", "IST-DAS-1.75bpw",
+    "UD-IQ1_S", "UD-IQ1_M", "UD-Q8_K_XL",
+)
+
+
+def setup_model_name(variant: str) -> str:
+    """Return the exact setup.py spelling for a launch model variant.
+
+    ``strata launch`` accepts any case (``gyro-s``), but ``strata install``
+    forwards the name to setup.py, whose argparse choices are literal
+    (``Gyro-S``). Unknown names pass through so setup.py can report them.
+    """
+    raw = (variant or "").strip()
+    for choice in SETUP_MODEL_CHOICES:
+        if choice.lower() == raw.lower():
+            return choice
+    return raw
+
 MTP_FETCH_GB = 5.2
 
 

@@ -147,6 +147,13 @@ Start with text-only mode.
 
 GPU availability, session length, and quotas depend on Kaggle's current policies and your account.
 
+The first code cell clones the helper repository into `/kaggle/working` and checks
+that it contains the helpers this notebook calls. `REPO_URL` in that cell must
+point at the repository you actually want to run. If you fork this project,
+update `REPO_URL` to your fork; otherwise Kaggle clones a checkout without these
+features and fails later with `AttributeError: module 'scripts.strata_kaggle'
+has no attribute ...`.
+
 ## 2. Add Kaggle API credentials as a Secret
 
 1. Create an API token using Kaggle's current account settings.

@@ -1,5 +1,30 @@
 # Troubleshooting
 
+## `AttributeError: module 'scripts.strata_kaggle' has no attribute ...`
+
+The notebook cloned a different checkout than the one that contains these
+helpers. The first code cell prints nothing about this directly; the failure
+appears in a later cell, for example:
+
+```
+AttributeError: module 'scripts.strata_kaggle' has no attribute 'validate_config'
+```
+
+Cause: `REPO_URL` in **1. Load helper scripts and Kaggle credentials** points at
+another repository, usually the original upstream project rather than the fork
+with these features.
+
+Fix:
+
+1. Edit `REPO_URL` in that cell to the repository you intend to run, for example
+   `https://github.com/<you>/devzonex-strata-kaggle.git`.
+2. Rerun the cell. It replaces a stale checkout instead of failing on `git pull`.
+3. If the checkout still reports missing helpers, the cell now names them and the
+   URL it used, so no later cell fails with a bare `AttributeError`.
+
+The cell verifies `validate_config`, `environment_report`, `announce_session`,
+`serve_until_idle`, `run_quality_gate` and `publish_connection` before using them.
+
 ## Model family or variant is unsupported
 
 Run the notebook's Strata plan cell and choose a family/variant accepted by the installed Strata release. Not every Hugging Face model is compatible with Strata. Review the plan before approving large downloads.

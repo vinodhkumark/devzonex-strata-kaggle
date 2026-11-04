@@ -15,7 +15,7 @@ from scripts.strata_kaggle import (_drafting_args, drafting_status, mtp_layer_pa
 from scripts.strata_kaggle import (agent_smoke, benchmark_api, environment_report,
                                    publish_connection, session_identity, serve_until_idle,
                                    validate_config)
-from scripts.strata_kaggle import find_attached_dataset
+from scripts.strata_kaggle import find_attached_dataset, attached_datasets, dataset_mount_report
 
 
 class StrataKaggleTests(unittest.TestCase):
@@ -626,6 +626,41 @@ class DatasetMountTests(unittest.TestCase):
             input_root.mkdir(parents=True)
             with patch("scripts.strata_kaggle.INPUT_ROOT", input_root):
                 self.assertIsNone(find_attached_dataset("owner", "absent", "manifest.json"))
+
+    def test_attached_datasets_lists_both_mount_layouts(self):
+        with tempfile.TemporaryDirectory() as td:
+            input_root = Path(td) / "input" / "datasets"
+            flat = Path(td) / "input" / "strata-runtime-cache"
+            nested = input_root / "owner" / "strata-model-gyro-gyro-s"
+            for path in (flat, nested):
+                path.mkdir(parents=True)
+                (path / "dataset-metadata.json").write_text("{}", encoding="utf-8")
+            with patch("scripts.strata_kaggle.INPUT_ROOT", input_root):
+                found = attached_datasets()
+            self.assertEqual(sorted(str(path) for path in found),
+                             sorted([str(flat), str(nested)]))
+
+    def test_attached_datasets_ignores_folders_without_metadata(self):
+        with tempfile.TemporaryDirectory() as td:
+            input_root = Path(td) / "input" / "datasets"
+            (input_root / "owner" / "not-a-dataset").mkdir(parents=True)
+            with patch("scripts.strata_kaggle.INPUT_ROOT", input_root):
+                self.assertEqual(attached_datasets(), [])
+                report = dataset_mount_report()
+            self.assertEqual(report["attached"], [])
+            self.assertIn(str(input_root), report["roots"])
+
+    def test_attached_datasets_does_not_walk_dataset_contents(self):
+        # A huge dataset should be reported without reading its files.
+        with tempfile.TemporaryDirectory() as td:
+            input_root = Path(td) / "input" / "datasets"
+            dataset = input_root / "owner" / "strata-model-gyro-gyro-s"
+            dataset.mkdir(parents=True)
+            (dataset / "dataset-metadata.json").write_text("{}", encoding="utf-8")
+            (dataset / "manifest.json").write_text("{}", encoding="utf-8")
+            with patch("scripts.strata_kaggle.INPUT_ROOT", input_root):
+                with patch.object(Path, "rglob", side_effect=AssertionError("walked the mount")):
+                    self.assertEqual(len(attached_datasets()), 1)
 
     def test_draft_layer_is_found_from_a_flat_mount(self):
         with tempfile.TemporaryDirectory() as td:

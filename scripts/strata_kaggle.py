@@ -289,6 +289,51 @@ def find_attached_dataset(owner: str, slug: str, marker: str | None = None) -> P
     return None
 
 
+def attached_datasets() -> list[Path]:
+    """Dataset directories mounted right now, without walking their files.
+
+    Kaggle writes dataset-metadata.json into every mounted dataset, so checking
+    the two mount layouts is enough. Walking the mount instead would read tens of
+    gigabytes of model files just to answer "is it attached?".
+    """
+    found: list[Path] = []
+    for root in _dataset_roots():
+        if not root.is_dir():
+            continue
+        try:
+            first_level = sorted(p for p in root.iterdir() if p.is_dir())
+        except OSError:
+            continue
+        for first in first_level:
+            candidates = [first]
+            try:
+                candidates += sorted(p for p in first.iterdir() if p.is_dir())
+            except OSError:
+                pass
+            for path in candidates:
+                if path not in found and (path / "dataset-metadata.json").is_file():
+                    found.append(path)
+    return found
+
+
+def dataset_mount_report() -> dict[str, Any]:
+    """Summarize the current input mounts so a missing dataset is diagnosable."""
+    roots = [str(root) for root in _dataset_roots()]
+    attached = [str(path) for path in attached_datasets()]
+    return {"roots": roots, "attached": attached}
+
+
+def log_mount_state() -> dict[str, Any]:
+    """Print what is mounted, so "not attached" comes with evidence."""
+    report = dataset_mount_report()
+    if report["attached"]:
+        log("Attached datasets: " + ", ".join(report["attached"]))
+    else:
+        log("No dataset is attached to this session (searched " + ", ".join(report["roots"])
+            + "). Add it under Add Input, then restart the session so it mounts.")
+    return report
+
+
 def safe_extract_runtime(archive: Path, destination: Path) -> None:
     """Safely extract runtime paths, normalizing internal absolute symlinks.
 
@@ -379,6 +424,7 @@ def restore_runtime_cache(owner: str, slug: str) -> bool:
     ds = find_attached_dataset(owner, slug, "strata-runtime-cache.bin")
     if not ds:
         log("Runtime cache not attached; Strata will be installed if needed.")
+        log_mount_state()
         return False
     archive = ds / "strata-runtime-cache.bin"
     if not archive.is_file():
@@ -560,6 +606,7 @@ def restore_model_cache(owner: str, slug: str, data_dir: Path, workers: int = 8,
     ds = find_attached_dataset(owner, slug, "manifest.json")
     if not ds:
         log("Model cache not attached; Strata will download the selected model on first launch.")
+        log_mount_state()
         return False
     try:
         manifest = json.loads((ds / "manifest.json").read_text(encoding="utf-8"))
@@ -1070,6 +1117,7 @@ def restore_draft_layer(owner: str, slug: str, data_dir: Path,
         if not _dataset_dirs(owner, slug):
             log("Draft-layer dataset " + owner + "/" + slug +
                 " is not attached; Strata will fetch the draft layer itself.")
+            log_mount_state()
             return False
         raise RuntimeError(
             "No MTP draft layer found in " + owner + "/" + slug +

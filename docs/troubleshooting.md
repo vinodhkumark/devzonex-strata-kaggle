@@ -25,6 +25,32 @@ Fix:
 The cell verifies `validate_config`, `environment_report`, `announce_session`,
 `serve_until_idle`, `run_quality_gate` and `publish_connection` before using them.
 
+## Model cache reports "not attached" but the dataset exists
+
+"It exists in **Your Datasets**" and "attached to this notebook" are different
+things. Only datasets added to the notebook's **Input** section are mounted.
+
+The cache cell now prints what is actually mounted. Two outcomes:
+
+- `Attached datasets: ...` — the dataset is mounted, but under a different name
+  or without the expected marker. Compare the printed paths with the slug the
+  notebook derived from `KAGGLE_USERNAME`, `MODEL_FAMILY` and `MODEL_VARIANT`.
+- `No dataset is attached to this session` — nothing is mounted. Add it with
+  **Add Input → Your Datasets**, then **restart the session**: Kaggle mounts
+  inputs at session start, so attaching during a running session often does not
+  take effect.
+
+To inspect the mount directly in a scratch cell:
+
+```python
+import scripts.strata_kaggle as sk
+print(sk.dataset_mount_report())
+```
+
+The report lists the roots that were searched and every dataset directory found,
+without reading the dataset's files. A model cache also needs `manifest.json` at
+the dataset's top level; a runtime cache needs `strata-runtime-cache.bin`.
+
 ## Model family or variant is unsupported
 
 Run the notebook's Strata plan cell and choose a family/variant accepted by the installed Strata release. Not every Hugging Face model is compatible with Strata. Review the plan before approving large downloads.

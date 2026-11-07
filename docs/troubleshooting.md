@@ -283,12 +283,18 @@ failed, and only the last one involves Strata.
   default).
 - `1016` / `1019`: the domain is not an active Cloudflare zone in the same
   account as the tunnel, or the dashboard hostname and `PUBLIC_HOSTNAME` differ.
-- `400` / `403` answered by Strata: the request arrived and the DNS-rebinding
-  check rejected the `Host`. Without `API_KEY`, the hostname must be in
-  `STRATA_ALLOWED_HOSTS`; `strata-in-kaggle-tuned.ipynb` adds it from
-  `PUBLIC_HOSTNAME` automatically.
-- A Cloudflare login page or `403`: a Zero Trust Access application guards the
-  hostname. Add a bypass or service token for `/v1`, or remove the application.
+- `403` answered by Strata (a JSON body; `server` present but no `cf-mitigated`
+  header): the request arrived and the DNS-rebinding check rejected the `Host`.
+  The hostname must be in `STRATA_ALLOWED_HOSTS` whether or not `API_KEY` is set —
+  an API key authenticates the client, it does not disable the host check.
+  `strata-in-kaggle-tuned.ipynb` always sets that list from `PORT`,
+  `.trycloudflare.com` and `PUBLIC_HOSTNAME`.
+- `403` with `cf-mitigated: challenge` or an HTML body comes from Cloudflare
+  itself: a Zero Trust Access application guards the hostname. Add a bypass or a
+  service token for `/v1`, or remove the application.
+- A Cloudflare login page or `403` with an HTML body: a Zero Trust Access
+  application guards the hostname. Add a bypass or service token for `/v1`, or
+  remove the application.
 
 Probe each layer from the notebook:
 

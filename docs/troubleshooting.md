@@ -289,6 +289,13 @@ failed, and only the last one involves Strata.
   an API key authenticates the client, it does not disable the host check.
   `strata-in-kaggle-tuned.ipynb` always sets that list from `PORT`,
   `.trycloudflare.com` and `PUBLIC_HOSTNAME`.
+- `403` with `error code: 1010` in the body, `server: cloudflare` and a
+  `text/plain` body: Cloudflare's **browser integrity / bot check** rejected the
+  client's `User-Agent` before the request reached Strata. A Python client sends
+  `Python-urllib/3.x` or a library `User-Agent` and is blocked. Fix it in
+  **Security → Bots**: turn Browser Integrity Check off for this hostname, or add
+  a WAF skip rule for `/v1/*` and `/health`. Do not chase this as an auth problem:
+  the server never saw the request, so the API key was never checked.
 - `403` with `cf-mitigated: challenge` or an HTML body comes from Cloudflare
   itself: a Zero Trust Access application guards the hostname. Add a bypass or a
   service token for `/v1`, or remove the application.

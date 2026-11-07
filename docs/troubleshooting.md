@@ -218,7 +218,39 @@ A 79.94-GiB model upload can take a long time. An output line saying `Dataset is
 
 ## Kaggle dataset slug already exists
 
-The helper attempts to create a dataset first. If the requested slug already exists, it should upload a new dataset version rather than create a duplicate. Wait for processing to finish and confirm the intended Version page in the Kaggle UI before repeating the command.
+`kaggle datasets create` prints this whenever the slug already exists, which is
+every re-run:
+
+```
+Dataset creation error: The requested slug "strata-runtime-cache" is already
+in use by a dataset. Please choose another slug.
+```
+
+That is not a failure by itself: the correct response is to upload a new version
+of the same dataset. The helper in `scripts/strata_kaggle.py` reads the message,
+recognises the slug conflict, and retries as `datasets version`. The tuned
+notebook (`strata-in-kaggle-tuned.ipynb`) retries on any non-zero exit instead,
+which hides the real reason when the retry also fails.
+
+Check what happened in the cell output:
+
+- `... uploaded - wait for 'Ready'` — the version upload worked. Wait for
+  **Ready** on the dataset page and continue; do not interrupt it or retry.
+- `... the upload failed (see the messages above)` — the version step failed
+  too. Run it by hand to see the actual error:
+
+  ```
+  kaggle datasets version -p /kaggle/working/strata-runtime-dataset-stage \
+      -m "update" --dir-mode skip
+  ```
+
+  `403` means the slug belongs to another account. Set `KAGGLE_USERNAME` to the
+  account that owns the Kaggle token: `strata-runtime-cache`,
+  `strata-<tag>-pack` and `strata-mtp-rt` are all derived from it. `404` means
+  the slug is not yours at all, so choose another one, for example
+  `<you>/strata-runtime-cache-v2`.
+
+Confirm the intended Version page in Kaggle before repeating an upload.
 
 ## Dataset upload permissions fail
 
@@ -233,6 +265,41 @@ Never paste the API key into notebook output, GitHub, issues, or chat.
 ## Cloudflare URL times out or changes
 
 A Quick Tunnel exists only while its process/session is active. Use the latest HTTPS URL printed by the notebook, check the Cloudflare log if needed, and update OpenCode's `baseURL`. Keep the Kaggle runtime and tunnel process running while using the model.
+
+## A named tunnel hostname does not work (`strata.cyberctl.com`)
+
+A named tunnel involves three independent layers. The error tells you which one
+failed, and only the last one involves Strata.
+
+- `cloudflared ... run --token` ignores a local `config.yml`. The hostname and
+  its service URL live in **Zero Trust → Networks → Tunnels → your tunnel →
+  Public Hostname**: subdomain `strata`, domain `cyberctl.com`, path empty,
+  service `HTTP` at `127.0.0.1:8080`. No notebook cell can create that rule.
+- `1033` (Cloudflare tunnel error): no `cloudflared` is registered with the edge.
+  The log shows `Registered tunnel connection` when it works. Regenerate the
+  token in the dashboard if it says `Invalid tunnel secret` or `Unauthorized`.
+- `502` / `530`: the tunnel is connected but the ingress rule is missing or
+  points at another port; it must match the notebook's `PORT` (`8080` by
+  default).
+- `1016` / `1019`: the domain is not an active Cloudflare zone in the same
+  account as the tunnel, or the dashboard hostname and `PUBLIC_HOSTNAME` differ.
+- `400` / `403` answered by Strata: the request arrived and the DNS-rebinding
+  check rejected the `Host`. Without `API_KEY`, the hostname must be in
+  `STRATA_ALLOWED_HOSTS`; `strata-in-kaggle-tuned.ipynb` adds it from
+  `PUBLIC_HOSTNAME` automatically.
+- A Cloudflare login page or `403`: a Zero Trust Access application guards the
+  hostname. Add a bypass or service token for `/v1`, or remove the application.
+
+Probe each layer from the notebook:
+
+```python
+import urllib.request
+print(urllib.request.urlopen("http://127.0.0.1:8080/health", timeout=10).status)
+print(urllib.request.urlopen("https://strata.cyberctl.com/health", timeout=30).status)
+```
+
+Both must return `200`. A failure on the first line is Strata; a Cloudflare error
+page on the second is the tunnel, its DNS, or an Access policy.
 
 ## OpenCode returns 401 or hangs
 

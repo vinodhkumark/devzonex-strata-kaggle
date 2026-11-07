@@ -76,6 +76,7 @@ Opening the notebook imports its code; it does **not** grant access to anyone el
 
 - **[Open the Kaggle launcher notebook](notebooks/Strata_Kaggle_Launcher.ipynb)** — serves the model
 - **[Open the cache builder notebook](notebooks/Strata_Cache_Builder.ipynb)** — CPU probe, dataset creation, GPU handoff
+- **[Strata cache-first notebook (tuned)](notebooks/strata-in-kaggle-tuned.ipynb)** — self-contained: restores the engine, the pack and the MTP layer from your private datasets, and supports a named Cloudflare tunnel with a fixed hostname
 - [Kaggle setup checklist](docs/kaggle-setup.md)
 - [OpenCode connection guide](docs/opencode-setup.md)
 - [Troubleshooting](docs/troubleshooting.md)

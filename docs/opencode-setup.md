@@ -7,17 +7,26 @@
 5. Merge the provider object printed by the notebook into the existing `providers` map in `opencode.jsonc`. Do not replace the rest of the config.
 6. Restart OpenCode and select the `strata/<model-id>` model.
 7. Start a fresh OpenCode session after changing provider or context settings.
-
-Keep the key out of GitHub and chat. The Quick Tunnel URL is temporary and changes after tunnel restart.
-
 8. The generated model entry sets `compatibility.reasoningField` to
    `reasoning_content`, so Strata's separate reasoning channel is treated as
    thinking instead of answer text. It also sets `headerTimeout` and
    `chunkTimeout` to 15 minutes: a T4 can spend minutes on the first token and
    can pause mid-answer while the engine pages experts.
 
+Keep the key out of GitHub and chat. The Quick Tunnel URL is temporary and changes after tunnel restart.
+
 The generated `limit.context` comes from the notebook's `CONTEXT` setting. If you
 change `CONTEXT`, regenerate the entry and start a fresh OpenCode session.
+
+### Fixed hostname instead of a Quick Tunnel
+
+`strata-in-kaggle-tuned.ipynb` supports a named tunnel (`CLOUDFLARE_TUNNEL_TOKEN`
+set), which keeps one hostname, for example `https://strata.cyberctl.com`. The
+hostname is configured in **Zero Trust → Networks → Tunnels → your tunnel →
+Public Hostname** with service `HTTP` at `127.0.0.1:8080`; a token run ignores a
+local `config.yml`. Use `https://strata.cyberctl.com/v1` as the provider
+`baseURL`, keep `API_KEY` set, and see
+[Troubleshooting](troubleshooting.md) if the hostname does not answer.
 
 ### Optional: publish the key encrypted
 
